@@ -1,0 +1,4700 @@
+diff --git a/cores/teensy4/AudioStream.h b/cores/teensy4/AudioStream.h
+index 90f0b0d..3357087 100644
+--- a/cores/teensy4/AudioStream.h
++++ b/cores/teensy4/AudioStream.h
+@@ -29,12 +29,35 @@
+  */
+ 
+ #ifndef AudioStream_h
++
++/*
++ * If the audio sample rate isn't defined on the command line, and
++ * hasn't yet been defined, then define it now:
++ */
++#ifndef AUDIO_SAMPLE_RATE_EXACT
++#define AUDIO_SAMPLE_RATE_EXACT 44100.0f
++#endif
++
++#ifndef AUDIO_SAMPLE_RATE_I
++#define AUDIO_SAMPLE_RATE_I 44100	//used for preprocessor conditionals in usb_desc.h
++#endif
++
++#ifndef AUDIO_SAMPLE_RATE
++#define AUDIO_SAMPLE_RATE AUDIO_SAMPLE_RATE_EXACT
++#endif
++
++#ifndef AUDIO_BLOCK_SAMPLES
++#define AUDIO_BLOCK_SAMPLES  128
++#endif
++
++#if !defined(IN_USB_DESC_H) // only sample rates are needed in usb_desc.h...
++// ...but we're not included from there: define the rest, too
+ #define AudioStream_h
+ 
+ #ifndef __ASSEMBLER__
++#include "Arduino.h"
+ #include <stdio.h>  // for NULL
+ #include <string.h> // for memcpy
+-
+ #endif
+ 
+ // AUDIO_BLOCK_SAMPLES determines how many samples the audio library processes
+@@ -50,24 +73,9 @@
+ //   AudioInputUSB, AudioOutputUSB, AudioPlaySdWav, AudioAnalyzeFFT256,
+ //   AudioAnalyzeFFT1024
+ 
+-#ifndef AUDIO_BLOCK_SAMPLES
+-#define AUDIO_BLOCK_SAMPLES  128
+-#endif
+-
+-#ifndef AUDIO_SAMPLE_RATE_EXACT
+-#define AUDIO_SAMPLE_RATE_EXACT 44100.0f
+-#endif
+-
+-#define AUDIO_SAMPLE_RATE AUDIO_SAMPLE_RATE_EXACT
+-
+ #define noAUDIO_DEBUG_CLASS // disable this class by default
+ 
+ #ifndef __ASSEMBLER__
+-class AudioStream;
+-class AudioConnection;
+-#if defined(AUDIO_DEBUG_CLASS)
+-class AudioDebug;  // for testing only, never for public release
+-#endif // defined(AUDIO_DEBUG_CLASS)
+ 
+ typedef struct audio_block_struct {
+ 	uint8_t  ref_count;
+@@ -76,6 +84,12 @@ typedef struct audio_block_struct {
+ 	int16_t  data[AUDIO_BLOCK_SAMPLES];
+ } audio_block_t;
+ 
++class AudioStream;
++class AudioConnection;
++
++#if defined(AUDIO_DEBUG_CLASS)
++class AudioDebug;  // for testing only, never for public release
++#endif // defined(AUDIO_DEBUG_CLASS)
+ 
+ 
+ class AudioConnection
+@@ -216,4 +230,5 @@ class AudioDebug
+ #endif // defined(AUDIO_DEBUG_CLASS)
+ 
+ #endif // __ASSEMBLER__
++#endif // defined(IN_USB_DESC_H)
+ #endif // AudioStream_h
+diff --git a/cores/teensy4/usb.c b/cores/teensy4/usb.c
+index ed2d6b8..b1f5d6e 100644
+--- a/cores/teensy4/usb.c
++++ b/cores/teensy4/usb.c
+@@ -10,13 +10,16 @@
+ #include "usb_flightsim.h"
+ #include "usb_touch.h"
+ #include "usb_midi.h"
+-#include "usb_audio.h"
++#include "usb_audio_interface.h"
+ #include "usb_mtp.h"
+ #include "core_pins.h" // for delay()
+ #include "avr/pgmspace.h"
+ #include <string.h>
+ #include "debug/printf.h"
+ 
++#define LSB(n) ((n) & 255)
++#define MSB(n) (((n) >> 8) & 255)
++
+ //#define LOG_SIZE  20
+ //uint32_t transfer_log_head=0;
+ //uint32_t transfer_log_count=0;
+@@ -90,7 +93,7 @@ static uint32_t endpointN_notify_mask=0;
+ //static int reset_count=0;
+ volatile uint8_t usb_configuration = 0; // non-zero when USB host as configured device
+ volatile uint8_t usb_high_speed = 0;    // non-zero if running at 480 Mbit/sec speed
+-static uint8_t endpoint0_buffer[8];
++static uint8_t endpoint0_buffer[14];
+ static uint8_t sof_usage = 0;
+ static uint8_t usb_reboot_timer = 0;
+ 
+@@ -414,7 +417,7 @@ static void endpoint0_setup(uint64_t setupdata)
+ 	setup_t setup;
+ 	uint32_t endpoint, dir, ctrl;
+ 	const usb_descriptor_list_t *list;
+-
++	//printf("wRequestAndType= %x, word1=%x, wIndex=%d\n", setup.wRequestAndType, setup.word1, setup.wIndex);
+ 	setup.bothwords = setupdata;
+ 	switch (setup.wRequestAndType) {
+ 	  case 0x0500: // SET_ADDRESS
+@@ -549,7 +552,7 @@ static void endpoint0_setup(uint64_t setupdata)
+ 					datalen = list->length;
+ 				}
+ 				if (datalen > setup.wLength) datalen = setup.wLength;
+-
++				printf("datalength: %x", datalen);
+ 				// copy the descriptor, from PROGMEM to DMAMEM
+ 				if (setup.wValue == 0x200) {
+ 					// config descriptor needs to adapt to speed
+@@ -617,6 +620,7 @@ static void endpoint0_setup(uint64_t setupdata)
+ #if defined(AUDIO_INTERFACE)
+ 	  case 0x0B01: // SET_INTERFACE (alternate setting)
+ 		if (setup.wIndex == AUDIO_INTERFACE+1) {
++	  		printf("case 0x0B01, word1=%x, wIndex=%d\n", setup.word1, setup.wIndex);
+ 			usb_audio_transmit_setting = setup.wValue;
+ 			if (usb_audio_transmit_setting > 0) {
+ 				// TODO: set up AUDIO_TX_ENDPOINT to transmit
+@@ -630,6 +634,7 @@ static void endpoint0_setup(uint64_t setupdata)
+ 		}
+ 		break;
+ 	  case 0x0A81: // GET_INTERFACE (alternate setting)
++	  	
+ 		if (setup.wIndex == AUDIO_INTERFACE+1) {
+ 			endpoint0_buffer[0] = usb_audio_transmit_setting;
+ 			endpoint0_transmit(endpoint0_buffer, 1, 0);
+@@ -640,39 +645,93 @@ static void endpoint0_setup(uint64_t setupdata)
+ 			return;
+ 		}
+ 		break;
+-	  case 0x0121: // SET FEATURE
+-	  case 0x0221:
+-	  case 0x0321:
+-	  case 0x0421:
+-		//printf("set_feature, word1=%x, len=%d\n", setup.word1, setup.wLength);
++	  
++	  //Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section A.14, Table A-14 page 134-135:
++	  //The only four audio class specific request are: 0x00 (UNDEFINED), 0x01 (CUR), 0x02 (RANGE), 0x03 (MEM)
++	  // Therefore the audio specific cases are:
++	  // 0x0121, 0x0221,  0x0321, 
++	  // 0x0122, 0x0222,  0x0322, 
++	  // 0x01A1, 0x02A1,  0x03A1, 
++	  // 0x01A2, 0x02A2,  0x03A2, 
++	  //all cases that end on '21': SET FEATURE directed to an interface (AudioControl or AudioStreaming)(Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 5.2.2, Table 5-1 page 90-91)
++	  //all cases that end on '22': SET FEATURE directed to isochronous endpoint of an AudioStreaming interface (Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 5.2.2, Table 5-1 page 90-91)
++	  case 0x0121: //-> set CUR request
++	  case 0x0221: //-> set RANGE request
++	  case 0x0321: //-> set MEM request
++	  
+ 		if (setup.wLength <= sizeof(endpoint0_buffer)) {
+ 			endpoint0_setupdata.bothwords = setupdata;
+ 			endpoint0_receive(endpoint0_buffer, setup.wLength, 1);
+ 			return; // handle these after ACK
+ 		}
+ 		break;
+-	  case 0x81A1: // GET FEATURE
+-	  case 0x82A1:
+-	  case 0x83A1:
+-	  case 0x84A1:
+-		if (setup.wLength <= sizeof(endpoint0_buffer)) {
++	  //all cases that end on 'A1': GET FEATURE directed to an interface (AudioControl or AudioStreaming)(Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 5.2.2, Table 5-1 page 90-91)
++	  //all cases that end on 'A2': GET FEATURE directed to isochronous endpoint of an AudioStreaming interface (Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 5.2.2, Table 5-1 page 90-91)
++
++	  case 0x01A1: //-> get CUR request
++	  	if(	LSB(setup.wIndex) == AUDIO_INTERFACE &&
++			MSB(setup.wIndex) == 0x3a		//0x3a is the bClockID	
++			){
++				if(setup.wValue == 0x0100){
++					//0x01...CS_SAM_FREQ_CONTROL 0x00... channel must be set to 0
++					endpoint0_buffer[0] = ((uint32_t)AUDIO_SAMPLE_RATE) & 255;
++					endpoint0_buffer[1] = (((uint32_t)AUDIO_SAMPLE_RATE) >> 8) & 255;
++					endpoint0_buffer[2] = (((uint32_t)AUDIO_SAMPLE_RATE) >> 16) & 255;
++					endpoint0_buffer[3] = 0;
++					uint32_t l = setup.wLength < 4 ? setup.wLength : 4;
++					endpoint0_transmit(endpoint0_buffer, l, 0);
++					return;
++				}
++				if(setup.wValue == 0x0200){
++					//0x02...CS_CLOCK_VALID_CONTROL 0x00... channel must be set to 0
++					endpoint0_buffer[0] = 1; //always valid
++					uint32_t l = setup.wLength < 1 ? setup.wLength : 1;
++					endpoint0_transmit(endpoint0_buffer, l, 0);
++					return;
++				}						
++			}
++	  case 0x02A1: //-> get RANGE request 
++	  	if(	LSB(setup.wIndex) == AUDIO_INTERFACE &&
++			MSB(setup.wIndex) == 0x3a &&	//0x3a is the bClockID	
++			setup.wValue == 0x0100			//range of clock
++			){
++				
++			endpoint0_buffer[0] = 1; //only one sub-range (LSB of 2 bytes)
++			endpoint0_buffer[1] = 0; //only one sub-range (MSB of 2 bytes)
++			//min value of range
++			endpoint0_buffer[2] = ((uint32_t)AUDIO_SAMPLE_RATE) & 255;
++			endpoint0_buffer[3] = (((uint32_t)AUDIO_SAMPLE_RATE) >> 8) & 255;
++			endpoint0_buffer[4] = (((uint32_t)AUDIO_SAMPLE_RATE) >> 16) & 255;
++			endpoint0_buffer[5] = 0;
++			//max value of range (=min value)
++			endpoint0_buffer[6]= endpoint0_buffer[2];
++			endpoint0_buffer[7]= endpoint0_buffer[3];
++			endpoint0_buffer[8]= endpoint0_buffer[4];
++			endpoint0_buffer[9]= endpoint0_buffer[5];
++			//resolution
++			endpoint0_buffer[10]= 0;
++			endpoint0_buffer[11]= 0;
++			endpoint0_buffer[12]= 0;
++			endpoint0_buffer[13]= 0;
++			uint32_t l = setup.wLength < 14 ? setup.wLength : 14;
++			endpoint0_transmit(endpoint0_buffer, l, 0);
++			return;
++						
++		}
++	  case 0x03A1: //-> get MEM request 
++		if(	LSB(setup.wIndex) == AUDIO_INTERFACE &&	
++			MSB(setup.wIndex) == 0x31		//0x31 is the bUnitID of the volume control	
++			){
+ 			uint32_t len;
+ 			if (usb_audio_get_feature(&setup, endpoint0_buffer, &len)) {
+ 				//printf("GET feature, len=%d\n", len);
+-				endpoint0_transmit(endpoint0_buffer, len, 0);
++				uint32_t l = setup.wLength < len ? setup.wLength : len;
++				endpoint0_transmit(endpoint0_buffer, l, 0);
+ 				return;
+ 			}
++			break;			
+ 		}
+-		break;
+-	  case 0x81A2: // GET_CUR (wValue=0, wIndex=interface, wLength=len)
+-		if (setup.wLength >= 3) {
+-			endpoint0_buffer[0] = 44100 & 255;
+-			endpoint0_buffer[1] = 44100 >> 8;
+-			endpoint0_buffer[2] = 0;
+-			endpoint0_transmit(endpoint0_buffer, 3, 0);
+-			return;
+-		}
+-		break;
++		
+ #endif
+ #if defined(MULTITOUCH_INTERFACE)
+ 	  case 0x01A1:
+@@ -712,7 +771,8 @@ static void endpoint0_setup(uint64_t setupdata)
+ 		break;
+ #endif
+ 	}
+-	printf("endpoint 0 stall\n");
++	//printf("endpoint 0 stall\n");
++	
+ 	USB1_ENDPTCTRL0 = 0x000010001; // stall
+ }
+ 
+@@ -854,7 +914,10 @@ static void endpoint0_complete(void)
+ 	}
+ #endif
+ #ifdef AUDIO_INTERFACE
+-	if (setup.word1 == 0x02010121 || setup.word1 == 0x01000121 /* TODO: check setup.word2 */) {
++		if( setup.wRequestAndType == 0x0121 && // set CUR
++			LSB(setup.wIndex) == AUDIO_INTERFACE &&	
++			MSB(setup.wIndex) == 0x31		//0x31 is the bUnitID of the volume control	
++			){
+ 		usb_audio_set_feature(&endpoint0_setupdata, endpoint0_buffer);
+ 	}
+ #endif
+diff --git a/cores/teensy4/usb_audio.cpp b/cores/teensy4/usb_audio.cpp
+index fa492a5..3797a01 100644
+--- a/cores/teensy4/usb_audio.cpp
++++ b/cores/teensy4/usb_audio.cpp
+@@ -28,497 +28,218 @@
+  * SOFTWARE.
+  */
+ 
+-#include <Arduino.h>
+-#include "usb_dev.h"
+ #include "usb_audio.h"
+-#include "debug/printf.h"
+ 
+ #ifdef AUDIO_INTERFACE
+ 
+-bool AudioInputUSB::update_responsibility;
+-audio_block_t * AudioInputUSB::incoming_left;
+-audio_block_t * AudioInputUSB::incoming_right;
+-audio_block_t * AudioInputUSB::ready_left;
+-audio_block_t * AudioInputUSB::ready_right;
+-uint16_t AudioInputUSB::incoming_count;
+-uint8_t AudioInputUSB::receive_flag;
+ 
+-struct usb_audio_features_struct AudioInputUSB::features = {0,0,FEATURE_MAX_VOLUME/2};
++audio_block_t* AudioInputUSB::rxBuffer[USBAudioInInterface::ringRxBufferSize][USB_AUDIO_MAX_NO_CHANNELS];
++audio_block_t* AudioOutputUSB::txBuffer[USBAudioOutInterface::ringTxBufferSize][USB_AUDIO_MAX_NO_CHANNELS];
+ 
+-extern volatile uint8_t usb_high_speed;
+-static void rx_event(transfer_t *t);
+-static void tx_event(transfer_t *t);
+-
+-/*static*/ transfer_t rx_transfer __attribute__ ((used, aligned(32)));
+-/*static*/ transfer_t sync_transfer __attribute__ ((used, aligned(32)));
+-/*static*/ transfer_t tx_transfer __attribute__ ((used, aligned(32)));
+-DMAMEM static uint8_t rx_buffer[AUDIO_RX_SIZE] __attribute__ ((aligned(32)));
+-DMAMEM static uint8_t tx_buffer[AUDIO_RX_SIZE] __attribute__ ((aligned(32)));
+-DMAMEM uint32_t usb_audio_sync_feedback __attribute__ ((aligned(32)));
+-
+-uint8_t usb_audio_receive_setting=0;
+-uint8_t usb_audio_transmit_setting=0;
+-uint8_t usb_audio_sync_nbytes;
+-uint8_t usb_audio_sync_rshift;
+-
+-uint32_t feedback_accumulator;
+-
+-volatile uint32_t usb_audio_underrun_count;
+-volatile uint32_t usb_audio_overrun_count;
+-
+-
+-static void rx_event(transfer_t *t)
+-{
+-	if (t) {
+-		int len = AUDIO_RX_SIZE - ((rx_transfer.status >> 16) & 0x7FFF);
+-		printf("rx %u\n", len);
+-		usb_audio_receive_callback(len);
++void AudioInputUSB::update(void){
++	int16_t bIdx = -1;
++	uint16_t noChannels;
++	_usbInterface.update(bIdx, noChannels);
++	if(bIdx != -1){
++		for (uint16_t i =0; i<noChannels; i++){
++			transmit(rxBuffer[bIdx][i], i);
++			release(rxBuffer[bIdx][i]);
++			rxBuffer[bIdx][i]=NULL;
++		}
++		_usbInterface.incrementBufferIndex();
+ 	}
+-	usb_prepare_transfer(&rx_transfer, rx_buffer, AUDIO_RX_SIZE, 0);
+-	arm_dcache_delete(&rx_buffer, AUDIO_RX_SIZE);
+-	usb_receive(AUDIO_RX_ENDPOINT, &rx_transfer);
+-}
+-
+-static void sync_event(transfer_t *t)
+-{
+-	// USB 2.0 Specification, 5.12.4.2 Feedback, pages 73-75
+-	//printf("sync %x\n", sync_transfer.status); // too slow, can't print this much
+-	usb_audio_sync_feedback = feedback_accumulator >> usb_audio_sync_rshift;
+-	usb_prepare_transfer(&sync_transfer, &usb_audio_sync_feedback, usb_audio_sync_nbytes, 0);
+-	arm_dcache_flush(&usb_audio_sync_feedback, usb_audio_sync_nbytes);
+-	usb_transmit(AUDIO_SYNC_ENDPOINT, &sync_transfer);
+ }
+-
+-void usb_audio_configure(void)
+-{
+-	printf("usb_audio_configure\n");
+-	usb_audio_underrun_count = 0;
+-	usb_audio_overrun_count = 0;
+-	feedback_accumulator = 739875226; // 44.1 * 2^24
+-	if (usb_high_speed) {
+-		usb_audio_sync_nbytes = 4;
+-		usb_audio_sync_rshift = 8;
+-	} else {
+-		usb_audio_sync_nbytes = 3;
+-		usb_audio_sync_rshift = 10;
++AudioInputUSB::AudioInputUSB(float kp,float ki) 
++	: AudioStream(0, NULL), _usbInterface(setBlockQuite,releaseBlock,allocateBlock,areBlocksReady,copy_to_buffers,kp, ki) {
++		        
++	for (uint16_t i =0; i< USBAudioInInterface::ringRxBufferSize; i++){
++		for (uint16_t j =0; j< USB_AUDIO_MAX_NO_CHANNELS; j++){
++			rxBuffer[i][j]=NULL;
++		}
+ 	}
+-	memset(&rx_transfer, 0, sizeof(rx_transfer));
+-	usb_config_rx_iso(AUDIO_RX_ENDPOINT, AUDIO_RX_SIZE, 1, rx_event);
+-	rx_event(NULL);
+-	memset(&sync_transfer, 0, sizeof(sync_transfer));
+-	usb_config_tx_iso(AUDIO_SYNC_ENDPOINT, usb_audio_sync_nbytes, 1, sync_event);
+-	sync_event(NULL);
+-	memset(&tx_transfer, 0, sizeof(tx_transfer));
+-	usb_config_tx_iso(AUDIO_TX_ENDPOINT, AUDIO_TX_SIZE, 1, tx_event);
+-	tx_event(NULL);
++	_usbInterface.begin();
+ }
+-
+-void AudioInputUSB::begin(void)
+-{
+-	incoming_count = 0;
+-	incoming_left = NULL;
+-	incoming_right = NULL;
+-	ready_left = NULL;
+-	ready_right = NULL;
+-	receive_flag = 0;
+-	// update_responsibility = update_setup();
+-	// TODO: update responsibility is tough, partly because the USB
+-	// interrupts aren't sychronous to the audio library block size,
+-	// but also because the PC may stop transmitting data, which
+-	// means we no longer get receive callbacks from usb.c
+-	update_responsibility = false;
++void AudioInputUSB::begin(void){
+ }
+ 
+-static void copy_to_buffers(const uint32_t *src, int16_t *left, int16_t *right, unsigned int len)
+-{
+-	uint32_t *target = (uint32_t*) src + len; 
+-	while ((src < target) && (((uintptr_t) left & 0x02) != 0)) {
+-		uint32_t n = *src++;
+-		*left++ = n & 0xFFFF;
+-		*right++ = n >> 16;
+-	}
+-
+-	while ((src < target - 2)) {
+-		uint32_t n1 = *src++;
+-		uint32_t n = *src++;
+-		*(uint32_t *)left = (n1 & 0xFFFF) | ((n & 0xFFFF) << 16);
+-		left+=2;
+-		*(uint32_t *)right = (n1 >> 16) | ((n & 0xFFFF0000)) ;
+-		right+=2;
+-	}
++float AudioInputUSB::getBufferedSamples() const{
++	return _usbInterface.getBufferedSamples();
++}
++float AudioInputUSB::getBufferedSamplesSmooth() const{
++	return _usbInterface.getBufferedSamplesSmooth();
++}
++float AudioInputUSB::getRequestedSamplingFrequ() const{
++	return _usbInterface.getRequestedSamplingFrequ();
++}
++float AudioInputUSB::getActualBIntervalUs() const{
++	return _usbInterface.getActualBIntervalUs();
++}
++USBAudioInInterface::Status AudioInputUSB::getStatus() const{
++	return _usbInterface.getStatus();
++}
+ 
+-	while ((src < target)) {
+-		uint32_t n = *src++;
+-		*left++ = n & 0xFFFF;
+-		*right++ = n >> 16;
++float AudioInputUSB::volume(void){
++	return _usbInterface.volume();
++}
++#if AUDIO_SUBSLOT_SIZE==2
++void AudioInputUSB::copy_to_buffers(const uint8_t *src, uint16_t bIdx, uint16_t noChannels, unsigned int count, unsigned int len) {
++	const uint16_t *src16Bit =(const uint16_t *)src;
++	for (uint32_t i =0; i< len; i++){
++		for (uint16_t j =0; j< noChannels; j++){
++			rxBuffer[bIdx][j]->data[count +i]=*src16Bit++;
++		}
+ 	}
+ }
++#endif
+ 
+-// Called from the USB interrupt when an isochronous packet arrives
+-// we must completely remove it from the receive buffer before returning
+-//
+-#if 1
+-void usb_audio_receive_callback(unsigned int len)
+-{
+-	unsigned int count, avail;
+-	audio_block_t *left, *right;
+-	const uint32_t *data;
+-
+-	AudioInputUSB::receive_flag = 1;
+-	len >>= 2; // 1 sample = 4 bytes: 2 left, 2 right
+-	data = (const uint32_t *)rx_buffer;
+-
+-	count = AudioInputUSB::incoming_count;
+-	left = AudioInputUSB::incoming_left;
+-	right = AudioInputUSB::incoming_right;
+-	if (left == NULL) {
+-		left = AudioStream::allocate();
+-		if (left == NULL) return;
+-		AudioInputUSB::incoming_left = left;
+-	}
+-	if (right == NULL) {
+-		right = AudioStream::allocate();
+-		if (right == NULL) return;
+-		AudioInputUSB::incoming_right = right;
+-	}
+-	while (len > 0) {
+-		avail = AUDIO_BLOCK_SAMPLES - count;
+-		if (len < avail) {
+-			copy_to_buffers(data, left->data + count, right->data + count, len);
+-			AudioInputUSB::incoming_count = count + len;
+-			return;
+-		} else if (avail > 0) {
+-			copy_to_buffers(data, left->data + count, right->data + count, avail);
+-			data += avail;
+-			len -= avail;
+-			if (AudioInputUSB::ready_left || AudioInputUSB::ready_right) {
+-				// buffer overrun, PC sending too fast
+-				AudioInputUSB::incoming_count = count + avail;
+-				if (len > 0) {
+-					usb_audio_overrun_count++;
+-					printf("!");
+-					//serial_phex(len);
+-				}
+-				return;
+-			}
+-			send:
+-			AudioInputUSB::ready_left = left;
+-			AudioInputUSB::ready_right = right;
+-			//if (AudioInputUSB::update_responsibility) AudioStream::update_all();
+-			left = AudioStream::allocate();
+-			if (left == NULL) {
+-				AudioInputUSB::incoming_left = NULL;
+-				AudioInputUSB::incoming_right = NULL;
+-				AudioInputUSB::incoming_count = 0;
+-				return;
+-			}
+-			right = AudioStream::allocate();
+-			if (right == NULL) {
+-				AudioStream::release(left);
+-				AudioInputUSB::incoming_left = NULL;
+-				AudioInputUSB::incoming_right = NULL;
+-				AudioInputUSB::incoming_count = 0;
+-				return;
+-			}
+-			AudioInputUSB::incoming_left = left;
+-			AudioInputUSB::incoming_right = right;
+-			count = 0;
+-		} else {
+-			if (AudioInputUSB::ready_left || AudioInputUSB::ready_right) return;
+-			goto send; // recover from buffer overrun
++#if AUDIO_SUBSLOT_SIZE==3
++void AudioInputUSB::copy_to_buffers(const uint8_t *src, uint16_t bIdx, uint16_t noChannels, unsigned int count, unsigned int len) {
++	for (uint32_t i =0; i< len; i++){
++		for (uint16_t j =0; j< noChannels; j++){
++			++src;
++			rxBuffer[bIdx][j]->data[count +i]=(*src++);
++			rxBuffer[bIdx][j]->data[count +i] |=(*src++)<<8;
+ 		}
+ 	}
+-	AudioInputUSB::incoming_count = count;
+ }
+ #endif
+-
+-void AudioInputUSB::update(void)
+-{
+-	audio_block_t *left, *right;
+-
+-	__disable_irq();
+-	left = ready_left;
+-	ready_left = NULL;
+-	right = ready_right;
+-	ready_right = NULL;
+-	uint16_t c = incoming_count;
+-	uint8_t f = receive_flag;
+-	receive_flag = 0;
+-	__enable_irq();
+-	if (f) {
+-		int diff = AUDIO_BLOCK_SAMPLES/2 - (int)c;
+-		feedback_accumulator += diff * 1;
+-		//uint32_t feedback = (feedback_accumulator >> 8) + diff * 100;
+-		//usb_audio_sync_feedback = feedback;
+-
+-		//printf(diff >= 0 ? "." : "^");
++bool AudioInputUSB::setBlockQuite(uint16_t bIdx, uint16_t channel){        
++	if(!rxBuffer[bIdx][channel]){
++		rxBuffer[bIdx][channel] = AudioStream::allocate();
+ 	}
+-	//serial_phex(c);
+-	//serial_print(".");
+-	if (!left || !right) {
+-		usb_audio_underrun_count++;
+-		//printf("#"); // buffer underrun - PC sending too slow
+-		if (f) feedback_accumulator += 3500;
++	if(rxBuffer[bIdx][channel]){
++		memset(rxBuffer[bIdx][channel]->data, 0, AUDIO_BLOCK_SAMPLES*sizeof(rxBuffer[bIdx][channel]->data[0]));
++		return true;
+ 	}
+-	if (left) {
+-		transmit(left, 0);
+-		release(left);
++	return false;
++}
++void AudioInputUSB::releaseBlock(uint16_t bIdx, uint16_t channel){        
++	if(rxBuffer[bIdx][channel]){
++		AudioStream::release(rxBuffer[bIdx][channel]);
++		rxBuffer[bIdx][channel]=NULL;
+ 	}
+-	if (right) {
+-		transmit(right, 1);
+-		release(right);
++}
++bool AudioInputUSB::allocateBlock(uint16_t bIdx, uint16_t channel){        
++	if(!rxBuffer[bIdx][channel]){
++		rxBuffer[bIdx][channel] = AudioStream::allocate();
+ 	}
++	return rxBuffer[bIdx][channel] != NULL;
+ }
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-#if 1
+-bool AudioOutputUSB::update_responsibility;
+-audio_block_t * AudioOutputUSB::left_1st;
+-audio_block_t * AudioOutputUSB::left_2nd;
+-audio_block_t * AudioOutputUSB::right_1st;
+-audio_block_t * AudioOutputUSB::right_2nd;
+-uint16_t AudioOutputUSB::offset_1st;
+-
+-/*DMAMEM*/ uint16_t usb_audio_transmit_buffer[AUDIO_TX_SIZE/2] __attribute__ ((used, aligned(32)));
+-
+-
+-static void tx_event(transfer_t *t)
+-{
+-	int len = usb_audio_transmit_callback();
+-	usb_audio_sync_feedback = feedback_accumulator >> usb_audio_sync_rshift;
+-	usb_prepare_transfer(&tx_transfer, usb_audio_transmit_buffer, len, 0);
+-	arm_dcache_flush_delete(usb_audio_transmit_buffer, len);
+-	usb_transmit(AUDIO_TX_ENDPOINT, &tx_transfer);
++bool AudioInputUSB::areBlocksReady(uint16_t bIdx, uint16_t noChannels){
++	for (uint16_t i =0; i<noChannels; i++){
++		if(!rxBuffer[bIdx][i]){
++			return false;
++		}
++	}
++	return true;
+ }
+ 
+ 
+-void AudioOutputUSB::begin(void)
+-{
+-	update_responsibility = false;
+-	left_1st = NULL;
+-	right_1st = NULL;
+-}
+ 
+-static void copy_from_buffers(uint32_t *dst, int16_t *left, int16_t *right, unsigned int len)
+-{
+-	// TODO: optimize...
+-	while (len > 0) {
+-		*dst++ = (*right++ << 16) | (*left++ & 0xFFFF);
+-		len--;
+-	}
+-}
+ 
+-void AudioOutputUSB::update(void)
+-{
+-	audio_block_t *left, *right;
+ 
+-	// TODO: we shouldn't be writing to these......
+-	//left = receiveReadOnly(0); // input 0 = left channel
+-	//right = receiveReadOnly(1); // input 1 = right channel
+-	left = receiveWritable(0); // input 0 = left channel
+-	right = receiveWritable(1); // input 1 = right channel
+-	if (usb_audio_transmit_setting == 0) {
+-		if (left) release(left);
+-		if (right) release(right);
+-		if (left_1st) { release(left_1st); left_1st = NULL; }
+-		if (left_2nd) { release(left_2nd); left_2nd = NULL; }
+-		if (right_1st) { release(right_1st); right_1st = NULL; }
+-		if (right_2nd) { release(right_2nd); right_2nd = NULL; }
+-		offset_1st = 0;
+-		return;
++AudioOutputUSB::AudioOutputUSB(void) :
++	AudioStream(USB_AUDIO_MAX_NO_CHANNELS, inputQueueArray),
++	_usbInterface(releaseBlocks, isBlockReady, copy_from_buffers)
++	{
++		begin();
++		_usbInterface.begin();
+ 	}
+-	if (left == NULL) {
+-		left = allocate();
+-		if (left == NULL) {
+-			if (right) release(right);
+-			return;
+-		}
+-		memset(left->data, 0, sizeof(left->data));
++AudioOutputUSB::AudioOutputUSB(int nch) :
++	AudioStream(nch, inputQueueArray),
++	_usbInterface(releaseBlocks, isBlockReady, copy_from_buffers)
++	{
++		begin();
++		_usbInterface.begin();
+ 	}
+-	if (right == NULL) {
+-		right = allocate();
+-		if (right == NULL) {
+-			release(left);
+-			return;
++void AudioOutputUSB::update(void){
++
++	int16_t bIdx = -1;
++	uint16_t noChannels;
++	_usbInterface.update(bIdx, noChannels);
++	if(bIdx < 0){
++		//_usbInterface is not running for some reason
++		for (uint16_t i =0; i< USB_AUDIO_MAX_NO_CHANNELS; i++){
++			audio_block_t* b = receiveReadOnly(i);
++			if(b){
++				release(b);
++			}
+ 		}
+-		memset(right->data, 0, sizeof(right->data));
+ 	}
+-	__disable_irq();
+-	if (left_1st == NULL) {
+-		left_1st = left;
+-		right_1st = right;
+-		offset_1st = 0;
+-	} else if (left_2nd == NULL) {
+-		left_2nd = left;
+-		right_2nd = right;
+-	} else {
+-		// buffer overrun - PC is consuming too slowly
+-		audio_block_t *discard1 = left_1st;
+-		left_1st = left_2nd;
+-		left_2nd = left;
+-		audio_block_t *discard2 = right_1st;
+-		right_1st = right_2nd;
+-		right_2nd = right;
+-		offset_1st = 0; // TODO: discard part of this data?
+-		//serial_print("*");
+-		release(discard1);
+-		release(discard2);
++	for (uint16_t i =0; i< noChannels; i++){
++		if(txBuffer[bIdx][i]){
++			release(txBuffer[bIdx][i]);
++		}
++		txBuffer[bIdx][i]=receiveReadOnly(i);
++		if(!txBuffer[bIdx][i]){
++			if(!txBuffer[bIdx][i]){
++				txBuffer[bIdx][i] = AudioStream::allocate();
++			}
++			if(txBuffer[bIdx][i]){
++				memset(txBuffer[bIdx][i]->data, 0, AUDIO_BLOCK_SAMPLES*sizeof(txBuffer[bIdx][i]->data[0]));
++			}
++			else {
++				//we ran out of audio memory
++				releaseBlocks(bIdx, noChannels);
++				break;
++			}
++		}
+ 	}
+-	__enable_irq();
++	_usbInterface.incrementBufferIndex();
+ }
+-
+-
+-// Called from the USB interrupt when ready to transmit another
+-// isochronous packet.  If we place data into the transmit buffer,
+-// the return is the number of bytes.  Otherwise, return 0 means
+-// no data to transmit
+-unsigned int usb_audio_transmit_callback(void)
+-{
+-	static uint32_t count=5;
+-	uint32_t avail, num, target, offset, len=0;
+-	audio_block_t *left, *right;
+-
+-	if (++count < 10) {   // TODO: dynamic adjust to match USB rate
+-		target = 44;
+-	} else {
+-		count = 0;
+-		target = 45;
+-	}
+-	while (len < target) {
+-		num = target - len;
+-		left = AudioOutputUSB::left_1st;
+-		if (left == NULL) {
+-			// buffer underrun - PC is consuming too quickly
+-			memset(usb_audio_transmit_buffer + len, 0, num * 4);
+-			//serial_print("%");
+-			break;
++void AudioOutputUSB::begin(void){        
++	for (uint16_t i =0; i< USBAudioOutInterface::ringTxBufferSize; i++){
++		for (uint16_t j =0; j< USB_AUDIO_MAX_NO_CHANNELS; j++){
++			txBuffer[i][j]=NULL;
+ 		}
+-		right = AudioOutputUSB::right_1st;
+-		offset = AudioOutputUSB::offset_1st;
+-
+-		avail = AUDIO_BLOCK_SAMPLES - offset;
+-		if (num > avail) num = avail;
+-
+-		copy_from_buffers((uint32_t *)usb_audio_transmit_buffer + len,
+-			left->data + offset, right->data + offset, num);
+-		len += num;
+-		offset += num;
+-		if (offset >= AUDIO_BLOCK_SAMPLES) {
+-			AudioStream::release(left);
+-			AudioStream::release(right);
+-			AudioOutputUSB::left_1st = AudioOutputUSB::left_2nd;
+-			AudioOutputUSB::left_2nd = NULL;
+-			AudioOutputUSB::right_1st = AudioOutputUSB::right_2nd;
+-			AudioOutputUSB::right_2nd = NULL;
+-			AudioOutputUSB::offset_1st = 0;
+-		} else {
+-			AudioOutputUSB::offset_1st = offset;
++	}
++}
++float AudioOutputUSB::getBufferedSamples() const{
++	return _usbInterface.getBufferedSamples();
++}
++float AudioOutputUSB::getBufferedSamplesSmooth() const{
++	return _usbInterface.getBufferedSamplesSmooth();
++}
++float AudioOutputUSB::getActualBIntervalUs() const{
++	return _usbInterface.getActualBIntervalUs();
++}
++USBAudioOutInterface::Status AudioOutputUSB::getStatus() const{
++	return _usbInterface.getStatus();
++}
++#if AUDIO_SUBSLOT_SIZE==2
++void AudioOutputUSB::copy_from_buffers(uint8_t *dst, uint16_t bIdx, uint16_t noChannels, unsigned int count, unsigned int len) {
++	uint16_t* dst16Bit = (uint16_t*)dst;
++	for (uint32_t i =0; i< len; i++){
++		for (uint16_t j =0; j< noChannels; j++){
++			*dst16Bit++ =txBuffer[bIdx][j]->data[count +i];
+ 		}
+ 	}
+-	return target * 4;
+ }
+ #endif
+ 
+-
+-
+-
+-struct setup_struct {
+-  union {
+-    struct {
+-	uint8_t bmRequestType;
+-	uint8_t bRequest;
+-	union {
+-		struct {
+-			uint8_t bChannel;  // 0=main, 1=left, 2=right
+-			uint8_t bCS;       // Control Selector
+-		};
+-		uint16_t wValue;
+-	};
+-	union {
+-		struct {
+-			uint8_t bIfEp;     // type of entity
+-			uint8_t bEntityId; // UnitID, TerminalID, etc.
+-		};
+-		uint16_t wIndex;
+-	};
+-	uint16_t wLength;
+-    };
+-  };
+-};
+-
+-int usb_audio_get_feature(void *stp, uint8_t *data, uint32_t *datalen)
+-{
+-	struct setup_struct setup = *((struct setup_struct *)stp);
+-	if (setup.bmRequestType==0xA1) { // should check bRequest, bChannel, and UnitID
+-			if (setup.bCS==0x01) { // mute
+-				data[0] = AudioInputUSB::features.mute;  // 1=mute, 0=unmute
+-				*datalen = 1;
+-				return 1;
+-			}
+-			else if (setup.bCS==0x02) { // volume
+-				if (setup.bRequest==0x81) { // GET_CURR
+-					data[0] = AudioInputUSB::features.volume & 0xFF;
+-					data[1] = (AudioInputUSB::features.volume>>8) & 0xFF;
+-				}
+-				else if (setup.bRequest==0x82) { // GET_MIN
+-					//serial_print("vol get_min\n");
+-					data[0] = 0;     // min level is 0
+-					data[1] = 0;
+-				}
+-				else if (setup.bRequest==0x83) { // GET_MAX
+-					data[0] = FEATURE_MAX_VOLUME;  // max level, for range of 0 to MAX
+-					data[1] = 0;
+-				}
+-				else if (setup.bRequest==0x84) { // GET_RES
+-					data[0] = 1; // increment vol by by 1
+-					data[1] = 0;
+-				}
+-				else { // pass over SET_MEM, etc.
+-					return 0;
+-				}
+-				*datalen = 2;
+-				return 1;
+-			}
++#if AUDIO_SUBSLOT_SIZE==3
++void AudioOutputUSB::copy_from_buffers(uint8_t *dst, uint16_t bIdx, uint16_t noChannels, unsigned int count, unsigned int len) {
++	for (uint32_t i =0; i< len; i++){
++		for (uint16_t j =0; j< noChannels; j++){
++			*dst++ =0;
++			*dst++ =((txBuffer[bIdx][j]->data[count +i])) & 255;
++			*dst++ =((txBuffer[bIdx][j]->data[count +i]) >> 8) & 255;
++		}
+ 	}
+-	return 0;
+ }
++#endif
+ 
+-int usb_audio_set_feature(void *stp, uint8_t *buf) 
+-{
+-	struct setup_struct setup = *((struct setup_struct *)stp);
+-	if (setup.bmRequestType==0x21) { // should check bRequest, bChannel and UnitID
+-			if (setup.bCS==0x01) { // mute
+-				if (setup.bRequest==0x01) { // SET_CUR
+-					AudioInputUSB::features.mute = buf[0]; // 1=mute,0=unmute
+-					AudioInputUSB::features.change = 1;
+-					return 1;
+-				}
+-			}
+-			else if (setup.bCS==0x02) { // volume
+-				if (setup.bRequest==0x01) { // SET_CUR
+-					AudioInputUSB::features.volume = buf[0];
+-					AudioInputUSB::features.change = 1;
+-					return 1;
+-				}
+-			}
++void AudioOutputUSB::releaseBlocks(uint16_t bIdx, uint16_t noChannels){  
++	for (uint16_t i =0; i< noChannels; i++){
++		if(txBuffer[bIdx][i]){
++			AudioStream::release(txBuffer[bIdx][i]);
++			txBuffer[bIdx][i]=NULL;
++		}
+ 	}
+-	return 0;
+ }
+ 
++bool AudioOutputUSB::isBlockReady(uint16_t bIdx, uint16_t channel){
++	return txBuffer[bIdx][channel]!=NULL;
++}
+ 
+-#endif // AUDIO_INTERFACE
++#endif //AUDIO_INTERFACE
+\ No newline at end of file
+diff --git a/cores/teensy4/usb_audio.h b/cores/teensy4/usb_audio.h
+index a53d6be..7669b32 100644
+--- a/cores/teensy4/usb_audio.h
++++ b/cores/teensy4/usb_audio.h
+@@ -30,78 +30,81 @@
+ 
+ #pragma once
+ 
+-#include "usb_desc.h"
+-#ifdef AUDIO_INTERFACE
++#include "usb_audio_interface.h"
+ 
+-#define FEATURE_MAX_VOLUME 0xFF  // volume accepted from 0 to 0xFF
+-
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-extern void usb_audio_configure();
+-extern uint16_t usb_audio_receive_buffer[];
+-extern uint16_t usb_audio_transmit_buffer[];
+-extern uint32_t usb_audio_sync_feedback;
+-extern uint8_t usb_audio_receive_setting;
+-extern uint8_t usb_audio_transmit_setting;
+-extern void usb_audio_receive_callback(unsigned int len);
+-extern unsigned int usb_audio_transmit_callback(void);
+-extern int usb_audio_set_feature(void *stp, uint8_t *buf);
+-extern int usb_audio_get_feature(void *stp, uint8_t *data, uint32_t *datalen);
+-#ifdef __cplusplus
+-}
+-#endif
+-
+-// audio features supported
+-struct usb_audio_features_struct {
+-  int change;  // set to 1 when any value is changed
+-  int mute;    // 1=mute, 0=unmute
+-  int volume;  // volume from 0 to FEATURE_MAX_VOLUME, maybe should be float from 0.0 to 1.0
+-};
++#ifdef AUDIO_INTERFACE
+ 
+-#ifdef __cplusplus
+ #include "AudioStream.h"
+ 
+ class AudioInputUSB : public AudioStream
+ {
+ public:
+-	AudioInputUSB(void) : AudioStream(0, NULL) { begin(); }
++	
++	AudioInputUSB(float kp =400.f,float ki =.2f );
+ 	virtual void update(void);
+ 	void begin(void);
+-	friend void usb_audio_receive_callback(unsigned int len);
+-	friend int usb_audio_set_feature(void *stp, uint8_t *buf);
+-	friend int usb_audio_get_feature(void *stp, uint8_t *data, uint32_t *datalen);
+-	static struct usb_audio_features_struct features;
+-	float volume(void) {
+-		if (features.mute) return 0.0;
+-		return (float)(features.volume) * (1.0 / (float)FEATURE_MAX_VOLUME);
+-	}
++	float getBufferedSamples() const;
++	float getBufferedSamplesSmooth() const;
++	float getRequestedSamplingFrequ() const;
++	float getActualBIntervalUs() const;
++	USBAudioInInterface::Status getStatus() const;
++	float volume(void);
++
+ private:
+-	static bool update_responsibility;
+-	static audio_block_t *incoming_left;
+-	static audio_block_t *incoming_right;
+-	static audio_block_t *ready_left;
+-	static audio_block_t *ready_right;
+-	static uint16_t incoming_count;
+-	static uint8_t receive_flag;
++	static void copy_to_buffers(const uint8_t *src, uint16_t bIdx, uint16_t noChannels, unsigned int count, unsigned int len);
++    static bool setBlockQuite(uint16_t bIdx, uint16_t channel);
++    static void releaseBlock(uint16_t bIdx, uint16_t channel);
++    static bool allocateBlock(uint16_t bIdx, uint16_t channel);
++    static bool areBlocksReady(uint16_t bIdx, uint16_t noChannels);
++
++    static audio_block_t* rxBuffer[USBAudioInInterface::ringRxBufferSize][USB_AUDIO_MAX_NO_CHANNELS];
++    USBAudioInInterface _usbInterface;
+ };
+ 
++
++#if USB_AUDIO_NO_CHANNELS_480 >= 4
++class AudioInputUSBQuad : public AudioInputUSB { public: AudioInputUSBQuad(float kp =400.f,float ki =.2f) : AudioInputUSB(kp, ki) {} };
++#if USB_AUDIO_NO_CHANNELS_480 >= 6
++class AudioInputUSBHex : public AudioInputUSB { public: AudioInputUSBHex(float kp =400.f,float ki =.2f) : AudioInputUSB(kp, ki) {} };
++#if USB_AUDIO_NO_CHANNELS_480 >= 8
++class AudioInputUSBOct : public AudioInputUSB { public: AudioInputUSBOct(float kp =400.f,float ki =.2f) : AudioInputUSB(kp, ki) {} };
++#endif // USB_AUDIO_NO_CHANNELS_480 >= 8
++#endif // USB_AUDIO_NO_CHANNELS_480 >= 6
++#endif // USB_AUDIO_NO_CHANNELS_480 >= 4
++
++
+ class AudioOutputUSB : public AudioStream
+ {
+ public:
+-	AudioOutputUSB(void) : AudioStream(2, inputQueueArray) { begin(); }
++	AudioOutputUSB(void);
++	AudioOutputUSB(int nch);
+ 	virtual void update(void);
+ 	void begin(void);
+-	friend unsigned int usb_audio_transmit_callback(void);
++    
++	float getBufferedSamples() const;
++	float getBufferedSamplesSmooth() const;
++	float getActualBIntervalUs() const;
++	USBAudioOutInterface::Status getStatus() const;    
++
+ private:
+-	static bool update_responsibility;
+-	static audio_block_t *left_1st;
+-	static audio_block_t *left_2nd;
+-	static audio_block_t *right_1st;
+-	static audio_block_t *right_2nd;
+-	static uint16_t offset_1st;
+-	audio_block_t *inputQueueArray[2];
++
++    static void copy_from_buffers(uint8_t *dst, uint16_t bIdx, uint16_t noChannels, unsigned int count, unsigned int len);
++	static void releaseBlocks(uint16_t bIdx, uint16_t noChannels);
++    static bool isBlockReady(uint16_t bIdx, uint16_t channel);
++
++	static audio_block_t* txBuffer[USBAudioOutInterface::ringTxBufferSize][USB_AUDIO_MAX_NO_CHANNELS];
++	audio_block_t *inputQueueArray[USB_AUDIO_MAX_NO_CHANNELS];
++    USBAudioOutInterface _usbInterface;
+ };
+-#endif // __cplusplus
++
++#if USB_AUDIO_NO_CHANNELS_480 >= 4
++class AudioOutputUSBQuad : public AudioOutputUSB { public: AudioOutputUSBQuad(void) : AudioOutputUSB(4) {} };
++#if USB_AUDIO_NO_CHANNELS_480 >= 6
++class AudioOutputUSBHex : public AudioOutputUSB { public: AudioOutputUSBHex(void) : AudioOutputUSB(6) {} };
++#if USB_AUDIO_NO_CHANNELS_480 >= 8
++class AudioOutputUSBOct : public AudioOutputUSB { public: AudioOutputUSBOct(void) : AudioOutputUSB(8) {} };
++#endif // USB_AUDIO_NO_CHANNELS_480 >= 8
++#endif // USB_AUDIO_NO_CHANNELS_480 >= 6
++#endif // USB_AUDIO_NO_CHANNELS_480 >= 4
+ 
+ #endif // AUDIO_INTERFACE
+diff --git a/cores/teensy4/usb_audio_interface.cpp b/cores/teensy4/usb_audio_interface.cpp
+new file mode 100644
+index 0000000..22bb335
+--- /dev/null
++++ b/cores/teensy4/usb_audio_interface.cpp
+@@ -0,0 +1,1072 @@
++/* Teensyduino Core Library
++ * http://www.pjrc.com/teensy/
++ * Copyright (c) 2017 PJRC.COM, LLC.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * 1. The above copyright notice and this permission notice shall be
++ * included in all copies or substantial portions of the Software.
++ *
++ * 2. If the Software is incorporated into a build system that allows
++ * selection among a list of target devices, then similar target
++ * devices manufactured by PJRC.COM must be included in the list of
++ * target devices and selectable in the same manner.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <Arduino.h>
++#include "usb_dev.h"
++#include "usb_audio_interface.h"
++#include "debug/printf.h"
++
++#include <string>
++
++#ifdef AUDIO_INTERFACE
++namespace {	
++	
++	//variables used by USBAudioInInterface and AudioOutputUSB ==================
++  #if (USB_AUDIO_NO_CHANNELS_12*AUDIO_NUM_SUBFRAMES_PER_POLLING_12) < (USB_AUDIO_NO_CHANNELS_480*AUDIO_NUM_SUBFRAMES_PER_POLLING_480)
++    #define AUDIO_TX_SIZE         AUDIO_RX_SIZE_480
++    #define AUDIO_RX_SIZE         AUDIO_RX_SIZE_480
++  #else
++    #define AUDIO_TX_SIZE         AUDIO_RX_SIZE_12
++    #define AUDIO_RX_SIZE         AUDIO_RX_SIZE_12
++  #endif
++
++	uint16_t noTransmittedChannels=0;	//depending if usb_high_speed if true this is either USB_AUDIO_MAX_NO_CHANNELS or 2 as fall-back strategy
++	float audioPollingIntervalSec=0;
++	uint16_t audioPollingIntervaluS =0;
++	uint32_t noSamplesPerPollingInterval=0;
++	constexpr uint32_t samplingRate=uint32_t(AUDIO_SAMPLE_RATE);
++	float expectedIsrIntervalCycles;
++
++	//======================================================================
++
++	//variables used by USBAudioInInterface ================================
++	LastCall<7> lastCallReceiveIsr;
++	float sumDiff=0.;
++	float lastDiff=0.;	
++	
++	constexpr float targetNumRxBufferedSamples = TARGET_RX_BUFFER_TIME_S*AUDIO_SAMPLE_RATE;
++	bool rxBufferReady= false;	                    //used to indicate if the reset after e.g. a buffer overrun is completed
++	volatile bool rxBufferOverrun = false;			//changed in usb_audio_receive_callback
++	volatile uint32_t rxMemoryUnderrunCounter=0;	//changed in usb_audio_receive_callback
++	volatile uint16_t incoming_rx_bIdx=0;			//changed in usb_audio_receive_callback
++	volatile uint16_t rxIncoming_count=0;			//changed in usb_audio_receive_callback
++	volatile uint8_t receive_flag;					//changed in usb_audio_receive_callback
++
++	uint16_t transmit_rx_bIdx=0;
++	uint32_t feedback_accumulator;
++	uint32_t feedback_accumulator_default;
++
++	volatile uint32_t rxUsb_audio_underrun_count;	//changed in update
++	volatile uint32_t rxUsb_audio_overrun_count;	//changed in update
++	
++	float getNumBufferedRxSamples(uint16_t incomingIdx, uint16_t transmitIdx, uint16_t incomingCount){
++		float bufferedSamples= incomingCount;
++		if(incomingIdx > transmitIdx+1 ){
++			bufferedSamples+=(incomingIdx-(transmitIdx+1))*AUDIO_BLOCK_SAMPLES;
++		}
++		else if(incomingIdx < transmitIdx){
++			bufferedSamples += incomingIdx*AUDIO_BLOCK_SAMPLES;
++			if(transmitIdx +1 < USBAudioInInterface::ringRxBufferSize){
++				bufferedSamples += (USBAudioInInterface::ringRxBufferSize-(transmitIdx +1))*AUDIO_BLOCK_SAMPLES;
++			}
++		}
++		return bufferedSamples;
++	}
++	//========================================================================
++}
++
++struct usb_audio_features_struct USBAudioInInterface::features = {0,0,FEATURE_MAX_VOLUME/2};
++USBAudioInInterface::SetBlockQuite USBAudioInInterface::setBlockQuite;
++USBAudioInInterface::ReleaseBlock USBAudioInInterface::releaseBlock;
++USBAudioInInterface::AllocateBlock USBAudioInInterface::allocateBlock;
++USBAudioInInterface::AreBlocksReady USBAudioInInterface::areBlocksReady;
++USBAudioInInterface::Copy_to_buffers USBAudioInInterface::copy_to_buffers;
++
++extern volatile uint8_t usb_high_speed;
++bool USBAudioInInterface::running=false;
++static void rx_event(transfer_t *t);
++static void tx_event(transfer_t *t);
++
++/*static*/ transfer_t rx_transfer __attribute__ ((used, aligned(32)));
++/*static*/ transfer_t sync_transfer __attribute__ ((used, aligned(32)));
++/*static*/ transfer_t tx_transfer __attribute__ ((used, aligned(32)));
++DMAMEM static uint8_t rx_buffer[AUDIO_RX_SIZE] __attribute__ ((aligned(32)));
++DMAMEM uint32_t usb_audio_sync_feedback __attribute__ ((aligned(32)));
++
++uint8_t usb_audio_receive_setting=0;	//set in usb.c
++uint8_t usb_audio_transmit_setting=0;	//set in usb.c
++uint8_t usb_audio_sync_nbytes;
++uint8_t usb_audio_sync_rshift;
++
++
++static void rx_event(transfer_t *t)
++{
++	if (t) {
++		int len = AUDIO_RX_SIZE - ((rx_transfer.status >> 16) & 0x7FFF);
++		//printf("rx %u\n", len);
++		usb_audio_receive_callback(len);
++	}
++	usb_prepare_transfer(&rx_transfer, rx_buffer, AUDIO_RX_SIZE, 0);
++	arm_dcache_delete(&rx_buffer, AUDIO_RX_SIZE);
++	usb_receive(AUDIO_RX_ENDPOINT, &rx_transfer);
++}
++
++static void sync_event(transfer_t *t)
++{
++	const uint32_t noRequestedBytes = feedback_accumulator/0x1000000* USB_AUDIO_NO_CHANNELS_480 * AUDIO_SUBSLOT_SIZE; //float fs = feedback_accumulator/(audioPollingIntervalSec*0x1000000);
++	if(noRequestedBytes>AUDIO_RX_SIZE_480){
++		//maximum amount
++		feedback_accumulator =AUDIO_RX_SIZE_480 *0x1000000/(USB_AUDIO_NO_CHANNELS_480 * AUDIO_SUBSLOT_SIZE);
++	}
++	// USB 2.0 Specification, 5.12.4.2 Feedback, pages 73-75
++	//printf("sync %x\n", sync_transfer.status); // too slow, can't print this much
++	usb_audio_sync_feedback = feedback_accumulator >> usb_audio_sync_rshift;
++	usb_prepare_transfer(&sync_transfer, &usb_audio_sync_feedback, usb_audio_sync_nbytes, 0);
++	arm_dcache_flush(&usb_audio_sync_feedback, usb_audio_sync_nbytes);
++	usb_transmit(AUDIO_SYNC_ENDPOINT, &sync_transfer);
++}
++
++USBAudioInInterface::Status USBAudioInInterface::getStatus() const{
++	USBAudioInInterface::Status status;
++	NVIC_DISABLE_IRQ(IRQ_SOFTWARE);
++	status.usb_audio_underrun_count = rxUsb_audio_underrun_count;
++	status.usb_audio_overrun_count = rxUsb_audio_overrun_count;
++	status.audio_memory_underrun_count = rxMemoryUnderrunCounter;
++	status.target_num_buffered_samples = targetNumRxBufferedSamples;
++	status.num_transmitted_channels = noTransmittedChannels;
++	status.ring_buffer_size = ringRxBufferSize;
++	status.usb_rx_tx_buffer_size = AUDIO_RX_SIZE;
++	status.receivingData=_streaming;
++	status.bInterval_uS = audioPollingIntervaluS;
++	status.usb_high_speed = usb_high_speed;
++	NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
++	return status;
++}
++
++void USBAudioInInterface::releaseBlocks(uint16_t bufferIdx){
++	for (uint16_t j =0; j< noTransmittedChannels; j++){
++        USBAudioInInterface::releaseBlock(bufferIdx, j);
++	}	
++}
++
++bool USBAudioInInterface::setBlocksQuite(uint32_t noBlocks){
++	bool allocationSuccessful=true;
++	for (uint16_t i =0; i< USBAudioInInterface::ringRxBufferSize; i++){
++		for (uint16_t j =0; j< noTransmittedChannels; j++){
++			if(i < noBlocks){
++                if (!USBAudioInInterface::setBlockQuite(i, j)){
++					//allocation failed
++					allocationSuccessful=false;
++					break;
++                }
++			}
++			else {
++                USBAudioInInterface::releaseBlock(i,j);
++			}
++		}
++	}
++	if(!allocationSuccessful){
++		for (uint16_t i =0; i< USBAudioInInterface::ringRxBufferSize; i++){
++			releaseBlocks(i);
++		}	
++	}
++	return allocationSuccessful;
++}
++
++bool USBAudioInInterface::allocateChannels(uint16_t idx){
++	for (uint16_t i =0; i< noTransmittedChannels; i++){
++		if(!USBAudioInInterface::allocateBlock(idx,i)){
++			//allocation failed	-> release all blocks that were allocated		
++			releaseBlocks(idx);
++			return false;
++		}
++	}
++	return true;
++}
++
++USBAudioInInterface::USBAudioInInterface(
++		SetBlockQuite sbq,
++		ReleaseBlock rb,
++		AllocateBlock ab,
++		AreBlocksReady abr,
++		Copy_to_buffers c_t_b,
++		float kp,
++		float ki) 
++		: _kp(kp), _ki(ki) 
++{
++	USBAudioInInterface::setBlockQuite =sbq;
++	USBAudioInInterface::releaseBlock = rb;
++	USBAudioInInterface::allocateBlock = ab;
++	USBAudioInInterface::areBlocksReady = abr;
++	USBAudioInInterface::copy_to_buffers = c_t_b;
++}
++
++
++void USBAudioInInterface::begin(){
++	__disable_irq();
++	if(USBAudioInInterface::running){
++		__enable_irq();
++		return;
++	}
++	USBAudioInInterface::running=true;
++	_bufferedSamplesSmooth=0;
++	_bufferedSamples=0;
++	rxIncoming_count = 0;
++	receive_flag = 0;
++	_streaming=false;
++	_lastCallUpdate.reset(blockDuration*F_CPU_ACTUAL);
++	lastCallReceiveIsr.reset(expectedIsrIntervalCycles);
++	__enable_irq();
++
++}
++
++
++float USBAudioInInterface::getActualBIntervalUs() const {
++	float toUS =1000000.f/F_CPU_ACTUAL;
++	NVIC_DISABLE_IRQ(IRQ_SOFTWARE);
++	float bInterval= (float)lastCallReceiveIsr.getLastDuration()*toUS;
++	NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
++	return bInterval;
++}
++
++
++void USBAudioInInterface::stop(){
++	__disable_irq();
++	if(!USBAudioInInterface::running){
++		__enable_irq();
++		return;
++	}
++	USBAudioInInterface::running=false;
++	_bufferedSamplesSmooth=0;
++	_bufferedSamples=0;
++	__enable_irq();
++}
++
++
++void USBAudioInInterface::tryIncreaseIdxIncoming(uint16_t& count){
++	uint16_t idx = (incoming_rx_bIdx+1)%ringRxBufferSize;
++	if(idx == transmit_rx_bIdx){
++		return;
++	}
++	incoming_rx_bIdx=idx;
++	if(!USBAudioInInterface::allocateChannels(incoming_rx_bIdx)){
++		rxMemoryUnderrunCounter++;
++		return;
++	}
++	count =0;	
++}
++
++// Called from the USB interrupt when an isochronous packet arrives
++// we must completely remove it from the receive buffer before returning
++//
++#if 1
++void usb_audio_receive_callback(unsigned int len)
++{	
++	if(!USBAudioInInterface::running){
++		return;
++	}
++	uint32_t t = ARM_DWT_CYCCNT;
++	lastCallReceiveIsr.addCall(t);
++
++	// Over-estimate of audio update() calls before the callback fires again:
++	receive_flag = (audioPollingIntervaluS * samplingRate / AUDIO_BLOCK_SAMPLES / 1'000'000) + 1;
++
++	if(!rxBufferReady){
++		return;
++	}
++	
++	len /= (AUDIO_SUBSLOT_SIZE* noTransmittedChannels); // 1 sample = AUDIO_SUBSLOT_SIZE bytes times noTransmittedChannels channels
++	uint16_t count =  rxIncoming_count;
++	const uint8_t *data = rx_buffer;
++	while (len > 0){
++		if(count == AUDIO_BLOCK_SAMPLES){
++			//we filled the blocks -> try to increase the ring buffer index and allocate new blocks 
++			USBAudioInInterface::tryIncreaseIdxIncoming(count);
++		}
++		if(count == AUDIO_BLOCK_SAMPLES){
++			//we were not able to increase the buffer index in the ring index
++			rxBufferOverrun=true;
++			rxIncoming_count=count;
++			return;
++		}
++		uint32_t avail = AUDIO_BLOCK_SAMPLES - count;
++		uint32_t numToCopy = min(avail, len);
++		USBAudioInInterface::copy_to_buffers(data, incoming_rx_bIdx, noTransmittedChannels, count, numToCopy);
++		data+=noTransmittedChannels*numToCopy *AUDIO_SUBSLOT_SIZE;
++		count+=numToCopy;
++		len-=numToCopy;
++	}
++	if(count == AUDIO_BLOCK_SAMPLES){
++		//maybe we can already provide the current incoming_rx_bIdx block and prevent a buffer underflow
++		//if tryIncreaseIdxIncoming fails now, there is still the chance that it will succeed at the next ISR call
++		USBAudioInInterface::tryIncreaseIdxIncoming(count);
++	}
++	rxIncoming_count=count;
++}
++#endif
++
++float USBAudioInInterface::getBufferedSamples() const{
++	NVIC_DISABLE_IRQ(IRQ_SOFTWARE);
++	float b = _bufferedSamples;
++	NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
++	return b;
++}
++float USBAudioInInterface::getBufferedSamplesSmooth() const{
++	NVIC_DISABLE_IRQ(IRQ_SOFTWARE);
++	float b = _bufferedSamplesSmooth;
++	NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
++	return b;
++}
++float USBAudioInInterface::getRequestedSamplingFrequ() const{	
++	NVIC_DISABLE_IRQ(IRQ_SOFTWARE);
++	float fs = feedback_accumulator/(audioPollingIntervalSec*0x1000000);
++	NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
++	return fs;
++}
++bool USBAudioInInterface::isBufferReady() {
++	if(transmit_rx_bIdx == incoming_rx_bIdx){
++		return false;
++	}
++    return USBAudioInInterface::areBlocksReady(transmit_rx_bIdx, noTransmittedChannels);
++}
++bool USBAudioInInterface::resetBuffer(double updateCurrentSmooth){
++	//resetBuffer should be called from the update function
++	//Here we prepare the buffer for the transmission after a buffer under- or overflow or at the beginning of a stream
++
++	//first we estimate when the last USB samples arrived
++	double timeSinceLastUSBPaket=0.;
++	History<7> historyIsr = lastCallReceiveIsr.getHistory();	//important: a new history is needed that is consistent with incoming_rx_bIdx
++	if(historyIsr.valid){
++		//historyUpdate.valid is always true
++		double lastIsrSmooth = lastCallReceiveIsr.getLastCall<2>(historyIsr, expectedIsrIntervalCycles);
++		timeSinceLastUSBPaket = toUInt32Range(updateCurrentSmooth - lastIsrSmooth);
++		timeSinceLastUSBPaket /= F_CPU_ACTUAL; //to seconds
++		if(timeSinceLastUSBPaket > 1.5f*audioPollingIntervalSec || timeSinceLastUSBPaket < -0.5f){
++			//normally this should not happen
++			timeSinceLastUSBPaket = 0.5f*blockDuration;
++		}
++	}
++	else {
++		timeSinceLastUSBPaket = expectedIsrIntervalCycles*0.5/F_CPU_ACTUAL;
++	}
++	//=====================================================
++
++	//now we set incoming_rx_bIdx, transmit_rx_bIdx and incoming_count
++	float resetTimeSec = TARGET_RX_BUFFER_TIME_S+blockDuration-timeSinceLastUSBPaket;	//+blockDuration because we want to transmit one block after this function
++	uint32_t resetSamples = uint32_t(resetTimeSec*AUDIO_SAMPLE_RATE);
++	uint32_t noBufferedBlocks = resetSamples/AUDIO_BLOCK_SAMPLES;
++	uint32_t count = resetSamples - noBufferedBlocks *AUDIO_BLOCK_SAMPLES;
++	uint32_t bufferIdx = noBufferedBlocks;
++
++	//We need to set incoming_count to back to the target value.
++	//Otherwise we will nearly have an overrun at the next update call.
++	//This would make it very difficult for the controller to work
++	rxIncoming_count = count;
++	incoming_rx_bIdx = uint16_t(bufferIdx);
++	transmit_rx_bIdx =0;
++	return USBAudioInInterface::allocateChannels(incoming_rx_bIdx);
++}
++
++void USBAudioInInterface::incrementBufferIndex(){
++    __disable_irq();
++    transmit_rx_bIdx = (transmit_rx_bIdx+1)%ringRxBufferSize;	//it is ok if transmit_rx_bIdx==incoming_rx_bIdx here
++    __enable_irq();   
++}
++void USBAudioInInterface::update(int16_t& bIdx, uint16_t& noChannels)
++{	
++    bIdx = -1;    // -1 means that there is nothing to transmit
++    noChannels =noTransmittedChannels;
++	
++	if(!USBAudioInInterface::running){
++		return;
++	}
++	//update time measurement of update calls
++	uint32_t clockCount = ARM_DWT_CYCCNT;
++	_lastCallUpdate.addCall(clockCount);
++	History<50> historyUpdate = _lastCallUpdate.getHistory();
++	double updateCurrentSmooth= _lastCallUpdate.getLastCall<20>(historyUpdate, blockDuration*F_CPU_ACTUAL);	
++	//=======================================
++
++	//get all information related to the USB receive ISR
++	__disable_irq();
++		History<7> historyIsr = lastCallReceiveIsr.getHistory();
++		bool bufferUnderflow = !isBufferReady();
++		rxBufferReady = !bufferUnderflow && !rxBufferOverrun;
++		if(rxBufferOverrun){
++			rxUsb_audio_overrun_count++;
++		}
++		uint16_t ic = rxIncoming_count;
++		uint16_t iIdx = incoming_rx_bIdx;
++		// Check if USB receive callback is firing correctly.
++		// Should never reach 0 if all is well.
++		uint8_t f = receive_flag;
++		if (receive_flag) receive_flag--;
++	__enable_irq();
++	//=======================================
++	if(_streaming && !f){
++		//the stream just stopped -> reset
++		_streaming=false;
++		lastCallReceiveIsr.reset(expectedIsrIntervalCycles);
++		sumDiff = 0.;
++		feedback_accumulator = feedback_accumulator_default;
++	}
++	
++	if ((_streaming && !rxBufferReady) ||	//we are already streaming but encounter a buffer over- or underrun
++		(!_streaming && f))	//we just start streaming -> we reset the buffer (fill it with the targeted number of samples)
++	{
++		_streaming = true;	//this is maybe the start of a stream
++		if(bufferUnderflow && f){
++			//we count under-runs only if we currently receive audio data from the host (f!=0)
++			rxUsb_audio_underrun_count++;
++		}
++		float resetTimeSec = TARGET_RX_BUFFER_TIME_S+blockDuration;	//+blockDuration because we will transmit one block after this function and want TARGET_RX_BUFFER_TIME_S after this transmission
++		uint32_t resetSamples = uint32_t(resetTimeSec*AUDIO_SAMPLE_RATE);
++		uint32_t noBufferedBlocks = resetSamples/AUDIO_BLOCK_SAMPLES +1;
++		if(setBlocksQuite(noBufferedBlocks)){
++			__disable_irq();
++			//this must all happen in one un-interrupted block
++			rxBufferReady=resetBuffer(updateCurrentSmooth);	
++			rxBufferOverrun=false;
++			bufferUnderflow=false;
++			ic = rxIncoming_count;
++			iIdx = incoming_rx_bIdx;
++			__enable_irq();
++		}
++		else {	
++			//can only happen if we run out of audio blocks/memory		
++			_streaming=false;
++			rxMemoryUnderrunCounter++;
++		}
++	}
++	//=======================================
++	
++	// If there was a receive event, we update the feedback for the USB host
++	// Important: first compute the buffered samples before the block transmission and update of transmit_rx_bIdx below!!
++	if (_streaming) {
++		//we compute the mismatch of the the targeted number of buffered samples and the actual buffered samples
++		float lastIsrSmooth = (float)lastCallReceiveIsr.getLastCall<2>(historyIsr, expectedIsrIntervalCycles);
++		float timeSinceLastIsr = (float)toUInt32Range(updateCurrentSmooth - lastIsrSmooth);			
++		timeSinceLastIsr /= F_CPU_ACTUAL; //to seconds
++		
++		_bufferedSamples= getNumBufferedRxSamples(iIdx, transmit_rx_bIdx, ic);
++		_bufferedSamplesSmooth=_bufferedSamples + timeSinceLastIsr * AUDIO_SAMPLE_RATE;
++
++		float diff= targetNumRxBufferedSamples -_bufferedSamplesSmooth;
++		if (abs(lastDiff) <= abs(diff)){
++			//we only add the current diff to the sum, if we the difference is not already decreasing
++			sumDiff +=diff;
++		}
++		lastDiff = diff;
++		feedback_accumulator = uint32_t(feedback_accumulator_default + double(_kp*diff)  + double(_ki*sumDiff) +0.5);
++		//========================================================================================================
++		
++		//if buffer is ready, we transmit all channels and increase the transmit index in the ring buffer (indicated by bIdx!=-1)
++		//then transmit_rx_bIdx needs to be increased (incrementBufferIndex gets called from outside after the blocks at ring buffer index transmit_rx_bIdx were transmitted and released.)
++        bIdx = (int16_t)transmit_rx_bIdx; 
++		//=========================================
++	}
++	
++}
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++#if 1
++
++namespace {	
++
++	
++	uint16_t incoming_tx_bIdx=0;
++	volatile uint16_t transmit_tx_bIdx=0;			//changed in usb_audio_transmit_callback
++	volatile USBAudioOutInterface::BufferState txBufferState = USBAudioOutInterface::ready;			//0: buffer can be used, 1: buffer is full, 2: buffer overrun changed in usb_audio_transmit_callback	
++	volatile float bufferedTxSamples=0.f;			//changed in usb_audio_transmit_callback
++	volatile float bufferedTxSamplesSmooth=0.f;		//changed in usb_audio_transmit_callback
++	volatile uint8_t transmit_flag;					//changed in usb_audio_transmit_callback
++	volatile bool streamStart=true;					//changed in usb_audio_transmit_callback
++
++	volatile uint32_t txUsb_audio_underrun_count =0;
++	volatile uint32_t txUsb_audio_overrun_count =0;
++	
++	volatile uint32_t num_skipped_Samples=0;
++	volatile uint32_t num_padded_Samples=0;
++	volatile uint32_t num_send_one_less=0;
++	volatile uint32_t num_send_one_more=0;
++
++	
++	LastCall<7> lastCallTransmitIsr;
++	constexpr float targetNumTxBufferedSamples = TARGET_TX_BUFFER_TIME_S*AUDIO_SAMPLE_RATE;
++
++	float getNumBufferedTxSamples(USBAudioOutInterface::BufferState txBufferState, uint32_t target, uint16_t incomingIdx, uint16_t transmitIdx, uint16_t outgoingCount){
++		float bufferedSamples= AUDIO_BLOCK_SAMPLES-outgoingCount;
++		if(txBufferState > USBAudioOutInterface::ready){
++			//buffer full or overrund
++			bufferedSamples +=(AUDIO_BLOCK_SAMPLES *(USBAudioOutInterface::ringTxBufferSize-1));
++			return bufferedSamples -target;	//-target because it's assumed that target number of samples will be transmitted after this function call
++		}
++		if(incomingIdx > transmitIdx+1 ){
++			bufferedSamples+=(incomingIdx-(transmitIdx+1))*AUDIO_BLOCK_SAMPLES;
++		}
++		else if(incomingIdx < transmitIdx){
++			bufferedSamples += incomingIdx*AUDIO_BLOCK_SAMPLES;
++			if(transmitIdx +1 < USBAudioOutInterface::ringTxBufferSize){
++				bufferedSamples += (USBAudioOutInterface::ringTxBufferSize-(transmitIdx +1))*AUDIO_BLOCK_SAMPLES;
++			}
++		}
++		return bufferedSamples-target;	//-target because it's assumed that target number of samples will be transmitted after this function call
++	}
++	
++	void updateDevCounter(float bufferDiff, uint32_t& devCounter, int8_t& sign){
++		const float thrs =2.f;	//acts as hysteresis, small deviations of targeted number of samples in the buffer are ignored
++		if (bufferDiff > thrs){
++			if(sign != 1){
++				devCounter=1;
++				sign=1;
++			}
++			else {
++				devCounter++;
++			}
++		}
++		else if (bufferDiff < -thrs){
++			if(sign != -1){
++				devCounter=1;
++				sign =-1;
++			}
++			else {
++				devCounter++;
++			}
++		}
++	}
++
++	void updateTarget(int8_t sign, uint32_t& devCounter, uint32_t& target){
++		if(sign == -1){
++			devCounter=0;
++			num_send_one_less++;
++			//we run out of samples -> slow transmission down
++            target--;
++		}
++		else if(sign ==1){
++			devCounter=0;
++			num_send_one_more++;
++			//we run out of buffer space -> speed transmission down
++			target++;
++		}
++	}
++#ifndef ASYNC_TX_ENDPOINT
++	void updateBufferOffset(int8_t sign, uint32_t& devCounter, uint16_t& offset){
++		if(sign == -1 && offset > 0){
++			devCounter=0;
++			num_padded_Samples++;
++			//one sample is transmitted twice
++			offset--;
++		}
++		else if(sign ==1 && offset < AUDIO_BLOCK_SAMPLES){
++			devCounter=0;
++			num_skipped_Samples++;
++			//we skip one sample in the buffer
++			offset++;
++		}
++	}
++#endif
++	uint32_t getTransmissionTarget(){
++		// Depending on the sampling frequency and the bInterval, we compute the number of samples that need to be transmitted.
++		//
++		// At 44.1 kHz and 1ms bInterval this function returns 9 times 44 samples and then 45 samples;
++		// at e.g. 188.4 kHz and 1ms bInterval the output is more 'complex': 
++		// three times 188, once 189, two times 188, once 189,... cycle starts again 
++		//
++		// This function does not take into account the current number of buffered samples, i.e. it does not change the target 
++		// number of samples in order to prevent buffer over- and under-runs.
++		// It's just a version of the Bresenham-Algorithm
++
++		const uint32_t N = samplingRate * audioPollingIntervaluS;
++		const uint32_t denominator = 1'000'000;
++
++		//target is first set to the default number of samples we send per frame.
++		//e.g. if samplingRate=44100 and audioPollingIntervaluS=1000 then base = 44
++		uint32_t target = N / denominator;	
++
++		//rem is the reminder of the devision 'N / denominator'. It represents the fractional samples (but multiplied by denominator).
++		uint32_t rem  = N % denominator;        
++		
++		//we accumulate the 'fractional' samples by means of the errorAccumulator. 0 <=errorAccumulator < denominator
++		static uint32_t errorAccumulator = 0;                   
++		errorAccumulator+=rem;
++		
++		if (errorAccumulator >= denominator)
++		{
++			errorAccumulator -= denominator;
++			target += 1;
++		}
++		return target;
++	}
++	
++	void resetTransmissionIndex(float virtualSamples, uint16_t incomingIdx, uint16_t& idx, uint16_t& count, uint16_t numSentSamples){
++		uint16_t targetNoSamples =uint16_t(targetNumTxBufferedSamples+numSentSamples-virtualSamples  + 0.f);	//+numSentSamples because we will immediatelly transmit 'numSentSamples' samples
++		uint16_t targetNumTxBufferedBlocks = uint16_t(targetNoSamples/AUDIO_BLOCK_SAMPLES);
++		count = AUDIO_BLOCK_SAMPLES-(targetNoSamples-targetNumTxBufferedBlocks*AUDIO_BLOCK_SAMPLES);
++		idx = (incomingIdx -(targetNumTxBufferedBlocks+1)+USBAudioOutInterface::ringTxBufferSize)%USBAudioOutInterface::ringTxBufferSize;
++	}
++
++	void resetStatusCounter(){
++		num_skipped_Samples=0;
++		num_padded_Samples=0;
++		num_send_one_less=0;
++		num_send_one_more=0;
++		txUsb_audio_underrun_count=0;
++		txUsb_audio_overrun_count=0;
++	}
++}
++double USBAudioOutInterface::updateCurrentSmooth=-1.;
++uint16_t USBAudioOutInterface::outgoing_count;
++bool USBAudioOutInterface::running=false;
++
++USBAudioOutInterface::ReleaseBlocks USBAudioOutInterface::releaseBlocks;
++USBAudioOutInterface::IsBlockReady USBAudioOutInterface::isBlockReady;
++USBAudioOutInterface::Copy_from_buffers USBAudioOutInterface::copy_from_buffer;
++
++/*DMAMEM*/ uint8_t usb_audio_transmit_buffer[AUDIO_TX_SIZE] __attribute__ ((used, aligned(32)));
++
++static void tx_event(transfer_t *t)
++{
++	int len = usb_audio_transmit_callback();
++	usb_audio_sync_feedback = feedback_accumulator >> usb_audio_sync_rshift;
++	usb_prepare_transfer(&tx_transfer, usb_audio_transmit_buffer, len, 0);
++	arm_dcache_flush_delete(usb_audio_transmit_buffer, len);
++	usb_transmit(AUDIO_TX_ENDPOINT, &tx_transfer);
++}
++USBAudioOutInterface::USBAudioOutInterface(ReleaseBlocks rbs, IsBlockReady ibr, Copy_from_buffers c_f_b) {
++		USBAudioOutInterface::releaseBlocks=rbs;
++		USBAudioOutInterface::isBlockReady=ibr;
++		USBAudioOutInterface::copy_from_buffer = c_f_b;
++}
++float USBAudioOutInterface::getActualBIntervalUs() const {
++	float toUS =1000000.f/F_CPU_ACTUAL;
++	NVIC_DISABLE_IRQ(IRQ_SOFTWARE);
++	float bInterval= (float)lastCallTransmitIsr.getLastDuration()*toUS;
++	NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
++	return bInterval;
++}
++void USBAudioOutInterface::begin(){
++	__disable_irq();
++	if(USBAudioOutInterface::running){
++		__enable_irq();
++		return;
++	}
++	outgoing_count = 0;
++	lastCallTransmitIsr.reset(expectedIsrIntervalCycles);		
++	_lastCallUpdate.reset(blockDuration*F_CPU_ACTUAL);
++	USBAudioOutInterface::running=true;
++	bufferedTxSamplesSmooth=0;
++	bufferedTxSamples=0;
++	__enable_irq();
++
++}
++void USBAudioOutInterface::stop(){
++	__disable_irq();
++	if(!USBAudioOutInterface::running){
++		__enable_irq();
++		return;
++	}
++	USBAudioOutInterface::running=false;
++	bufferedTxSamplesSmooth=0;
++	bufferedTxSamples=0;
++	__enable_irq();
++}
++
++USBAudioOutInterface::Status USBAudioOutInterface::getStatus() const{
++	USBAudioOutInterface::Status status;
++	NVIC_DISABLE_IRQ(IRQ_SOFTWARE);
++	status.usb_audio_underrun_count = txUsb_audio_underrun_count;
++	status.usb_audio_overrun_count = txUsb_audio_overrun_count;
++	status.target_num_buffered_samples = targetNumTxBufferedSamples;
++	status.num_transmitted_channels = noTransmittedChannels;
++	status.ring_buffer_size = ringTxBufferSize;
++	status.usb_rx_tx_buffer_size = AUDIO_TX_SIZE;
++	status.transmittingData=_streaming;
++	status.bInterval_uS = audioPollingIntervaluS;
++	status.num_skipped_Samples = num_skipped_Samples;
++	status.num_padded_Samples = num_padded_Samples;
++	status.num_send_one_less = num_send_one_less;
++	status.num_send_one_more = num_send_one_more;
++	status.usb_high_speed = usb_high_speed;
++	NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
++	return status;
++}
++
++void USBAudioOutInterface::update(int16_t& bIdx, uint16_t& noChannels)
++{	
++	noChannels=noTransmittedChannels;
++	if(!running){
++		bIdx = -1;
++		return;
++	}
++	//update time measurement of update calls
++	uint32_t t = ARM_DWT_CYCCNT;
++	_lastCallUpdate.addCall(t);
++	History<50> historyUpdate = _lastCallUpdate.getHistory();	
++	_updateCurrentSmoothPending= _lastCallUpdate.getLastCall<20>(historyUpdate, blockDuration*F_CPU_ACTUAL);
++	//=======================================
++	
++	__disable_irq();
++		streamStart=transmit_flag && !_streaming;	
++		_streaming=transmit_flag != 0;		
++		if (transmit_flag) transmit_flag--;
++		if(txBufferState < overrun && incoming_tx_bIdx == transmit_tx_bIdx){
++			txBufferState=overrun;
++		}
++		if(txBufferState == overrun){	
++			//only set in case of buffer overrun. Normally updateCurrentSmooth should only be set in combination with the incoming_tx_bIdx incrementation
++			updateCurrentSmooth= _updateCurrentSmoothPending;
++		}
++		BufferState s = txBufferState;
++	__enable_irq();
++	if(!_streaming){
++		resetStatusCounter();
++		bufferedTxSamplesSmooth=0.f;
++		bufferedTxSamples=0.f;
++	}
++	if(s == overrun){
++		txUsb_audio_overrun_count++;
++	}
++	bIdx=incoming_tx_bIdx;
++}
++
++void USBAudioOutInterface::incrementBufferIndex(){
++	__disable_irq();
++		updateCurrentSmooth= _updateCurrentSmoothPending;
++		incoming_tx_bIdx=(incoming_tx_bIdx+1)%ringTxBufferSize;
++		if(txBufferState < full && incoming_tx_bIdx == transmit_tx_bIdx){
++			txBufferState = full;
++		}
++	__enable_irq();
++}
++void USBAudioOutInterface::tryIncreaseIdxTransmission(uint16_t& tBIdx, uint16_t& offset){
++	while (offset >= AUDIO_BLOCK_SAMPLES){
++		USBAudioOutInterface::releaseBlocks(tBIdx, noTransmittedChannels);			
++		uint16_t idxCandidate =(tBIdx+1)%ringTxBufferSize;
++		if(idxCandidate != incoming_tx_bIdx){
++			tBIdx = idxCandidate;
++			offset -=AUDIO_BLOCK_SAMPLES;
++		}
++		else {
++			offset = AUDIO_BLOCK_SAMPLES;	 //we make sure that offset is never larger than AUDIO_BLOCK_SAMPLES!
++			break;
++		}
++	}
++}
++float USBAudioOutInterface::getBufferedSamples() const{
++	NVIC_DISABLE_IRQ(IRQ_SOFTWARE);
++	float b = bufferedTxSamples;
++	NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
++	return b;
++}
++float USBAudioOutInterface::getBufferedSamplesSmooth() const{
++	NVIC_DISABLE_IRQ(IRQ_SOFTWARE);
++	float b = bufferedTxSamplesSmooth;
++	NVIC_ENABLE_IRQ(IRQ_SOFTWARE);
++	return b;
++}
++
++// Called from the USB interrupt when ready to transmit another
++// isochronous packet.
++// the return is the number of bytes to transmit
++unsigned int usb_audio_transmit_callback(void)
++{	
++	//compute the number of samples we want to transmit (at 44.1kHz and a bInterval of 1ms that is either 44 or 45 samples)
++	uint32_t target = getTransmissionTarget();
++	if(!USBAudioOutInterface::running){
++		//Some hosts (Linux, Windows) would tolerate zero length data packages.
++		//However, sometimes there are troubles with MacOs.
++		//So we better always send the expected number of samples.
++		const uint32_t numBytes =target*noTransmittedChannels*AUDIO_SUBSLOT_SIZE;
++		uint8_t *data = usb_audio_transmit_buffer;
++		memset(data, 0, numBytes);
++		return target * noTransmittedChannels*AUDIO_SUBSLOT_SIZE;
++	}
++
++	// data transmitted: may get multiple blocks before it happens again
++	transmit_flag = (audioPollingIntervaluS * samplingRate / AUDIO_BLOCK_SAMPLES / 1'000'000) + 1;
++
++	//time measurement (needed for the computation of virtual samples)
++	uint32_t current =ARM_DWT_CYCCNT;
++	lastCallTransmitIsr.addCall(current);
++	//================================================================
++
++	
++	const uint16_t iBIdx = incoming_tx_bIdx;	//we are not allowed to change incoming_tx_bIdx 
++	uint16_t tBIdx = transmit_tx_bIdx;
++	uint16_t offset = USBAudioOutInterface::outgoing_count;
++
++	//============================================================
++	const uint32_t devCounterThrs =10;
++	static uint32_t devCounter=0;	//how often in a row there were too many or too few samples, if counter reaches 'devCounterThrs', we take some action (hysteresis)
++	static int8_t sign =0;			//-1... too few samples in the buffer, 0... state not known, 1... too many samples in the buffer
++	float virtualSamples =0.f;
++	if(USBAudioOutInterface::updateCurrentSmooth !=-1.){
++		
++		History<7> historyIsr = lastCallTransmitIsr.getHistory();
++		float lastIsrSmooth = (float)lastCallTransmitIsr.getLastCall<2>(historyIsr, expectedIsrIntervalCycles);
++		float timeSinceLastUpdate = (float)toUInt32Range(lastIsrSmooth - USBAudioOutInterface::updateCurrentSmooth);
++		timeSinceLastUpdate /= F_CPU_ACTUAL; //to seconds
++		if (timeSinceLastUpdate > 1.5f*USBAudioOutInterface::blockDuration || timeSinceLastUpdate < -0.5f*USBAudioOutInterface::blockDuration){
++			//something really went wrong since update is normally called eveey blockDuration seconds
++			//-> we use the average value to prevent serious problems
++			timeSinceLastUpdate =0.5f*USBAudioOutInterface::blockDuration;
++		}		
++		virtualSamples =timeSinceLastUpdate * AUDIO_SAMPLE_RATE;
++		
++		bufferedTxSamples= getNumBufferedTxSamples(txBufferState, target, iBIdx, tBIdx, offset);
++		bufferedTxSamplesSmooth=bufferedTxSamples +  virtualSamples;
++		updateDevCounter(bufferedTxSamplesSmooth -targetNumTxBufferedSamples, devCounter, sign);		
++	}
++
++	if(txBufferState == USBAudioOutInterface::overrun || streamStart){
++		streamStart=false;
++		devCounter=0;
++		resetTransmissionIndex(virtualSamples, iBIdx, tBIdx, offset, noSamplesPerPollingInterval);		
++		USBAudioOutInterface::releaseBlocks(tBIdx, noTransmittedChannels);		
++		txBufferState=USBAudioOutInterface::ready;
++	}
++#ifdef ASYNC_TX_ENDPOINT
++    if(devCounter == devCounterThrs){
++        updateTarget(sign, devCounter, target);
++    }	
++#endif
++	uint32_t len=0;
++	uint8_t *data = usb_audio_transmit_buffer;
++
++	while (len < target) {
++		uint32_t num = target - len;
++		uint32_t avail = AUDIO_BLOCK_SAMPLES - offset;
++		if( avail==0 ||	!USBAudioOutInterface::isBlockReady(tBIdx,0)){
++			//Something went wrong. We either did not receive a block, or a buffer underrun occured.
++			//We will reset the buffer indices and offsets and transmit zeros.
++			if( avail==0){
++				devCounter=0;	//only reset in case of an underrun and not if USBAudioOutInterface did not receive data in 'update'
++				txUsb_audio_underrun_count++;
++				resetTransmissionIndex(virtualSamples, iBIdx, tBIdx, offset, num);		
++			}
++			const uint32_t numBytes = num*noTransmittedChannels*AUDIO_SUBSLOT_SIZE;
++			memset(data, 0, numBytes);
++		}
++		else {
++			if (num > avail){
++				num = avail;
++			}
++			USBAudioOutInterface::copy_from_buffer(data, tBIdx, noTransmittedChannels, offset, num);	
++		}
++		data += num*noTransmittedChannels*AUDIO_SUBSLOT_SIZE;
++		len+=num;
++		offset+=num;	//num can be larger than 'AUDIO_BLOCK_SAMPLES' in case of 'avail==0 ||	!USBAudioOutInterface::isBlockReady(tBIdx,0)'
++#ifndef ASYNC_TX_ENDPOINT
++		if(devCounter == devCounterThrs){
++			updateBufferOffset(sign, devCounter, offset);
++		}
++#endif
++		if (offset >= AUDIO_BLOCK_SAMPLES) {
++			USBAudioOutInterface::tryIncreaseIdxTransmission(tBIdx,offset);
++		}
++	}
++	transmit_tx_bIdx=tBIdx;
++	USBAudioOutInterface::outgoing_count = offset;
++
++	return target * noTransmittedChannels*AUDIO_SUBSLOT_SIZE;
++}
++#endif
++
++
++
++
++
++void usb_audio_configure(void)
++{
++	rxUsb_audio_underrun_count = 0;
++	rxUsb_audio_overrun_count = 0;
++	rxMemoryUnderrunCounter=0;
++	sumDiff=0.;
++	lastDiff=0.;
++	rxBufferReady= false;
++	incoming_rx_bIdx=0;
++	transmit_rx_bIdx=0;
++	if (usb_high_speed) {
++		noTransmittedChannels   = USB_AUDIO_NO_CHANNELS_480;
++		audioPollingIntervalSec = AUDIO_POLLING_INTERVAL_480_SEC;
++		audioPollingIntervaluS  = AUDIO_NUM_SUBFRAMES_PER_POLLING_480 * MICROFRAME_US;
++		usb_audio_sync_nbytes   = 4;
++		usb_audio_sync_rshift   = 8;
++	} else {
++		noTransmittedChannels   = USB_AUDIO_NO_CHANNELS_12;
++		audioPollingIntervalSec = AUDIO_POLLING_INTERVAL_12_SEC;
++		audioPollingIntervaluS  = AUDIO_NUM_SUBFRAMES_PER_POLLING_12 * MICROFRAME_US;
++		usb_audio_sync_nbytes   = 3;
++		usb_audio_sync_rshift   = 10;
++	}
++
++	noSamplesPerPollingInterval = (samplingRate*audioPollingIntervaluS)/1'000'000;
++
++	feedback_accumulator_default = uint32_t((samplingRate *audioPollingIntervalSec) * 0x1000000 +0.5f);
++	feedback_accumulator = feedback_accumulator_default;
++
++	memset(&rx_transfer, 0, sizeof(rx_transfer));
++	usb_config_rx_iso(AUDIO_RX_ENDPOINT, AUDIO_RX_SIZE, 1, rx_event);
++	rx_event(NULL);
++	memset(&sync_transfer, 0, sizeof(sync_transfer));
++	usb_config_tx_iso(AUDIO_SYNC_ENDPOINT, usb_audio_sync_nbytes, 1, sync_event);
++	sync_event(NULL);
++	memset(&tx_transfer, 0, sizeof(tx_transfer));
++	usb_config_tx_iso(AUDIO_TX_ENDPOINT, AUDIO_TX_SIZE, 1, tx_event);
++	tx_event(NULL);
++	expectedIsrIntervalCycles = audioPollingIntervalSec *F_CPU_ACTUAL;
++	lastCallReceiveIsr.reset(expectedIsrIntervalCycles);
++
++	//AudioOutputUSB	==============================
++	resetStatusCounter();
++	//=================================================
++}
++
++
++
++
++
++
++struct setup_struct {
++  //union {
++    struct {
++	uint8_t bmRequestType;
++	uint8_t bRequest;
++	union {
++		struct {
++			uint8_t bChannel;  // 0=main, 1=left, 2=right
++			uint8_t bCS;       // Control Selector
++		};
++		uint16_t wValue;
++	};
++	union {
++		struct {
++			uint8_t bIfEp;     // type of entity
++			uint8_t bEntityId; // UnitID, TerminalID, etc.
++		};
++		uint16_t wIndex;
++	};
++	uint16_t wLength;
++    };
++  //};
++};
++
++int usb_audio_get_feature(void *stp, uint8_t *data, uint32_t *datalen)
++{
++
++	struct setup_struct setup = *((struct setup_struct *)stp);
++	if(setup.bmRequestType != 0xA1){
++		//was not a get feature request directed to the feature unit
++		return 0;
++	}
++	
++	if (setup.bRequest==0x02) { // -> request = RANGE
++		if (setup.bCS==0x01) { // mute
++			data[0] =1; //only one sub-range (LSB of 2 bytes)
++			data[1] =0; //only one sub-range (MSB of 2 bytes)
++			data[2] =0;	//unmute
++			data[3] = 1; //mute
++			data[4] = 1; //resolution
++			*datalen = 5;
++			return 1;
++		}
++		else if (setup.bCS==0x02) { // volume
++			//Have a look at the UAC2 specification page 102, section 5.2.5.7.2 Volume Control
++			const int16_t maxVol = FEATURE_MAX_VOLUME;
++			data[0] = 1; //only one sub-range (LSB of 2 bytes)
++			data[1] = 0; //only one sub-range (MSB of 2 bytes)
++			data[2] = 0;	// min level is 0 (LSB)
++			data[3] = 0; 	// min level is 0 (MSB)
++			data[4] = maxVol & 0xFF;  		// max level, for range of 0 to MAX (LSB)
++			data[5] = (maxVol>>8) & 0xFF;	// max level, for range of 0 to MAX (MSB)
++			data[6] = 1;	// increment vol by by 1 (LSB)
++			data[7] = 0;	// increment vol by by 1 (MSB)
++			*datalen = 8;
++			return 1;
++		}
++		else { // pass over SET_MEM, etc.
++			return 0;
++		}
++	}
++	if (setup.bRequest==0x01) { // -> request = CUR
++		if (setup.bCS==0x01) { // mute
++			data[0] = USBAudioInInterface::features.mute;  // 1=mute, 0=unmute
++			*datalen = 1;
++			return 1;
++		}
++		else if (setup.bCS==0x02) { // volume
++			const int16_t vol = (int16_t)USBAudioInInterface::features.volume;
++			data[0] = vol & 0xFF;	//(LSB)
++			data[1] = (vol>>8) & 0xFF; //(MSB)
++			*datalen = 2;
++			return 1;
++		}
++		else { // pass over SET_MEM, etc.
++			return 0;
++		}
++	}
++	return 0;
++}
++
++int usb_audio_set_feature(void *stp, uint8_t *buf) 
++{
++	struct setup_struct setup = *((struct setup_struct *)stp);
++	if (setup.bmRequestType==0x21) { // SET FEATURE should check bRequest, bChannel and UnitID
++			if (setup.bCS==0x01) { // mute
++				if (setup.bRequest==0x01) { // CUR
++					// if(Serial){
++					// 	Serial.println("set mute");
++					// }
++					USBAudioInInterface::features.mute = buf[0]; // 1=mute,0=unmute
++					USBAudioInInterface::features.change = 1;
++					return 1;
++				}
++			}
++			else if (setup.bCS==0x02) { // volume
++				if (setup.bRequest==0x01) { // CUR
++					//Have a look at the UAC2 specification page 102, section 5.2.5.7.2 Volume Control
++					//volume uses two bytes
++					const int16_t *volPtr =(const int16_t *)buf;
++					USBAudioInInterface::features.volume = *volPtr;
++					USBAudioInInterface::features.change = 1;
++					return 1;
++				}
++			}
++	}
++	return 0;
++}
++
++
++#endif // AUDIO_INTERFACE
+diff --git a/cores/teensy4/usb_audio_interface.h b/cores/teensy4/usb_audio_interface.h
+new file mode 100644
+index 0000000..61f0d40
+--- /dev/null
++++ b/cores/teensy4/usb_audio_interface.h
+@@ -0,0 +1,197 @@
++/* Teensyduino Core Library
++ * http://www.pjrc.com/teensy/
++ * Copyright (c) 2017 PJRC.COM, LLC.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * 1. The above copyright notice and this permission notice shall be
++ * included in all copies or substantial portions of the Software.
++ *
++ * 2. If the Software is incorporated into a build system that allows
++ * selection among a list of target devices, then similar target
++ * devices manufactured by PJRC.COM must be included in the list of
++ * target devices and selectable in the same manner.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#pragma once
++
++
++#include "usb_desc.h"
++#ifdef AUDIO_INTERFACE
++
++#include "util/LastCall.h"
++
++#define FEATURE_MAX_VOLUME 0xFF  // volume accepted from 0 to 0xFF
++#define TARGET_RX_BUFFER_TIME_S 0.0018f	//targeted buffered time (latency) in seconds
++#define MICROFRAME_US 125 // defined by the USB standard
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern void usb_audio_configure();
++extern uint8_t usb_audio_receive_setting;
++extern uint8_t usb_audio_transmit_setting;
++extern void usb_audio_receive_callback(unsigned int len);
++extern unsigned int usb_audio_transmit_callback(void);
++extern int usb_audio_set_feature(void *stp, uint8_t *buf);
++extern int usb_audio_get_feature(void *stp, uint8_t *data, uint32_t *datalen);
++#ifdef __cplusplus
++}
++#endif
++
++// audio features supported
++struct usb_audio_features_struct {
++  int change;  // set to 1 when any value is changed
++  int mute;    // 1=mute, 0=unmute
++  int volume;  // volume from 0 to FEATURE_MAX_VOLUME, maybe should be float from 0.0 to 1.0
++};
++
++#ifdef __cplusplus
++
++class USBAudioInInterface
++{
++public:
++	struct Status {
++		uint32_t usb_audio_underrun_count;		//How often did we run out of audio samples. (usb host sends audio data too slowly)
++		uint32_t usb_audio_overrun_count;		//How often did we run out of buffer space.  (usb host sends audio data too fast)
++		uint32_t audio_memory_underrun_count;	//How often did we run out audio blocks.  (Increase N in AudioMemory(N) if that happens)
++		float target_num_buffered_samples;		//How many samples do want to be in the buffer directly after an 'update' call (the more samples, the more stable. Should at least be: (bInterval_uS*e-6) * AUDIO_SAMPLE_RATE)
++		uint16_t num_transmitted_channels;		//How many audio channels do we receive (might be smaller than expected in case the 12Mbit/s bandwidth limits the number of channels)
++		uint16_t ring_buffer_size;				//Number of audio blocks per channel in the ring buffer (received audio data from the host is stored in this buffer)
++		uint16_t usb_rx_tx_buffer_size;			//=AUDIO_RX_SIZE_480 or AUDIO_RX_SIZE_12 (bytes, must be larger than AUDIO_SAMPLE_RATE * bInterval_uS*1e-6 * USB_AUDIO_NO_CHANNELS_480 * AUDIO_SUBSLOT_SIZE 
++		uint16_t bInterval_uS;					//polling interval as requested by the Teensy (125, 250, 500 or 1000)
++		bool receivingData;						//Teensy is currently receiving data (There was at least one 'usb_audio_receive_callback' since the last 'update' call)
++		uint8_t usb_high_speed;					// 1 for high speed, 0 otherwise
++	};
++	typedef bool (*SetBlockQuite) (uint16_t bIdx, uint16_t channel);
++	typedef void (*ReleaseBlock)(uint16_t bIdx, uint16_t channel);
++	typedef bool (*AllocateBlock)(uint16_t bIdx, uint16_t channel);
++	typedef bool (*AreBlocksReady)(uint16_t bIdx, uint16_t noChannels);
++	typedef void (*Copy_to_buffers)(const uint8_t *src, uint16_t bIdx, uint16_t noChannels, unsigned int count, unsigned int len);
++    constexpr static float blockDuration = AUDIO_BLOCK_SAMPLES/float(AUDIO_SAMPLE_RATE);
++	//no buffered blocks computation
++	//
++	// +3:
++	// +1 we round the number of needed blocks up
++	// +1 because we store the block that is ready for transmission in the buffer
++	// +1 just to have one block in reserve (prevents buffer overflows and comes at more or less no additional cost (at normal operation no additional latency + no additional memory needed))
++	// *2: because to be symmetrically protected against buffer overflow (a high TARGET_RX_BUFFER_TIME_S only prevents buffer underflows)
++	constexpr static uint16_t ringRxBufferSize = uint16_t(TARGET_RX_BUFFER_TIME_S / USBAudioInInterface::blockDuration) *2 +3;	
++	
++	USBAudioInInterface(
++		SetBlockQuite sbq,
++		ReleaseBlock rb,
++		AllocateBlock ab,
++		AreBlocksReady abr,
++		Copy_to_buffers c_t_b,
++		float kp =400.f,
++		float ki =.2f );
++	void begin();
++	void stop();
++    void update(int16_t& bIdx, uint16_t& noChannels);
++    void incrementBufferIndex();
++	float getBufferedSamples() const;
++	float getBufferedSamplesSmooth() const;
++	float getRequestedSamplingFrequ() const;
++	float getActualBIntervalUs() const;
++	Status getStatus() const;
++	friend void usb_audio_receive_callback(unsigned int len);
++	friend int usb_audio_set_feature(void *stp, uint8_t *buf);
++	friend int usb_audio_get_feature(void *stp, uint8_t *data, uint32_t *datalen);
++	static struct usb_audio_features_struct features;
++	float volume(void) {
++		if (features.mute) return 0.0;
++		return (float)(features.volume) * (1.0 / (float)FEATURE_MAX_VOLUME);
++	}
++
++private:
++	uint32_t _bufferedSamples=0;
++	float _kp =400.f;
++	float _ki =.2f;
++	float _bufferedSamplesSmooth=0;
++	bool _streaming= false;
++	LastCall<50> _lastCallUpdate;
++	static bool setBlocksQuite(uint32_t noBlocks);
++	static bool allocateChannels(uint16_t idx);
++	static bool resetBuffer(double updateCurrentSmooth);
++	static bool isBufferReady();
++	static void tryIncreaseIdxIncoming(uint16_t& count);
++	static void releaseBlocks(uint16_t bufferIdx);
++	static bool running;
++
++	static SetBlockQuite setBlockQuite;
++	static ReleaseBlock releaseBlock;
++	static AllocateBlock allocateBlock;
++	static AreBlocksReady areBlocksReady;
++	static Copy_to_buffers copy_to_buffers;
++};
++
++#define TARGET_TX_BUFFER_TIME_S 0.0035f	//targeted buffered time (latency) in seconds
++class USBAudioOutInterface {
++public:
++	enum BufferState{ready, full, overrun};
++	struct Status {
++		uint32_t usb_audio_underrun_count;	//How often did we run out of audio samples. (usb host requests audio data too fast)
++		uint32_t usb_audio_overrun_count;	//How often did we run out of buffer space.  (usb host requests audio data too slowly)
++		float target_num_buffered_samples;	//How many samples do want to be in the buffer directly after an 'usb_audio_transmit_callback' call (the more samples, the more stable. Should at least be: AUDIO_BLOCK_SAMPLES)
++		uint16_t num_transmitted_channels;	//How many audio channels do we transmit (might be smaller than expected in case the 12Mbit/s bandwidth limits the number of channels)
++		uint16_t ring_buffer_size;			//Number of audio blocks per channel in the ring buffer (audio blocks from the Teensy are stored in this buffer, before the data is sent to the host.)
++		uint16_t usb_rx_tx_buffer_size;		//=AUDIO_TX_SIZE_480 or AUDIO_TX_SIZE_12 (bytes, must be larger than AUDIO_SAMPLE_RATE * bInterval_uS*1e-6 * USB_AUDIO_NO_CHANNELS_480 * AUDIO_SUBSLOT_SIZE 
++		uint16_t bInterval_uS;				//polling interval as requested by the Teensy (125, 250, 500 or 1000)
++		uint32_t num_skipped_Samples;		//only used if not ASYNC_TX_ENDPOINT (->adaptive endpoint)	In usb_audio_transmit_callback: how often was a sample skipped to prevent a buffer overrun.
++		uint32_t num_padded_Samples;		//only used if not ASYNC_TX_ENDPOINT (->sdaptive endpoint)	In usb_audio_transmit_callback: how often was a sample padded to prevent a buffer underrun.
++		uint32_t num_send_one_less;			//only used if ASYNC_TX_ENDPOINT (-> asynchronous endpoint)	In usb_audio_transmit_callback: how often was a sample less than initially planned sent to prevent a buffer underrun.
++		uint32_t num_send_one_more;			//only used if ASYNC_TX_ENDPOINT (-> asynchronous endpoint)	In usb_audio_transmit_callback: how often was a sample more than initially planned sent to prevent a buffer overrun.
++		bool transmittingData;				//Teensy is currently sending data to the host (There was at least one 'usb_audio_transmit_callback' since the last 'update' call)
++		uint8_t usb_high_speed;				// 1 for high speed, 0 otherwise
++	};
++
++	typedef void (*ReleaseBlocks)(uint16_t bIdx, uint16_t noChannels);
++	typedef bool (*IsBlockReady)(uint16_t bIdx, uint16_t channel);
++	typedef void (*Copy_from_buffers)(uint8_t *dst, uint16_t bIdx, uint16_t noChannels, unsigned int count, unsigned int len);
++    
++	constexpr static float blockDuration = AUDIO_BLOCK_SAMPLES/float(AUDIO_SAMPLE_RATE);
++	constexpr static uint16_t ringTxBufferSize = uint16_t(TARGET_TX_BUFFER_TIME_S / USBAudioInInterface::blockDuration) *2 +3;	
++
++	USBAudioOutInterface(ReleaseBlocks rbs, IsBlockReady ibr, Copy_from_buffers c_f_b);
++	void begin(void);
++	void stop(void);
++	void update(int16_t& bIdx, uint16_t& noChannels);
++	void incrementBufferIndex();
++	friend unsigned int usb_audio_transmit_callback(void);
++	float getBufferedSamples() const;
++	float getBufferedSamplesSmooth() const;
++	float getActualBIntervalUs() const;
++	Status getStatus() const;
++private:
++	static void tryIncreaseIdxTransmission(uint16_t& tBIdx, uint16_t& offset);
++	bool _streaming= false;
++	double _updateCurrentSmoothPending;
++	LastCall<50> _lastCallUpdate;
++	static double updateCurrentSmooth;
++	static uint16_t outgoing_count;
++	static bool running;
++	
++	static ReleaseBlocks releaseBlocks;
++	static IsBlockReady isBlockReady;
++	static Copy_from_buffers copy_from_buffer;
++};
++
++#endif // __cplusplus
++
++#endif // AUDIO_INTERFACE
+diff --git a/cores/teensy4/usb_desc.c b/cores/teensy4/usb_desc.c
+index 010e3ef..967297d 100644
+--- a/cores/teensy4/usb_desc.c
++++ b/cores/teensy4/usb_desc.c
+@@ -636,12 +636,30 @@ static uint8_t microsoft_os_compatible_id_desc[] = {
+ 
+ #define AUDIO_INTERFACE_DESC_POS	KEYMEDIA_INTERFACE_DESC_POS+KEYMEDIA_INTERFACE_DESC_SIZE
+ #ifdef  AUDIO_INTERFACE
+-#define AUDIO_INTERFACE_DESC_SIZE	8 + 9+10+12+9+12+10+9 + 9+9+7+11+9+7 + 9+9+7+11+9+7+9
++
++#if USB_AUDIO_NO_CHANNELS_480 > 8
++      //we restrict the volume controlled number of channels to 8 (there is still the master volume for all channels)
++      #define FEATURE_UNIT_DESC_SIZE_480 (6 + (1+8)*4)
++#else
++      #define FEATURE_UNIT_DESC_SIZE_480 (6 + (1+USB_AUDIO_NO_CHANNELS_480)*4)
++#endif
++
++#if USB_AUDIO_NO_CHANNELS_12 > 8
++      //we restrict the volume controlled number of channels to 8 (there is still the master volume for all channels)
++      #define FEATURE_UNIT_DESC_SIZE_12 (6 + (1+8)*4)
+ #else
+-#define AUDIO_INTERFACE_DESC_SIZE	0
++      #define FEATURE_UNIT_DESC_SIZE_12 (6 + (1+USB_AUDIO_NO_CHANNELS_12)*4)
+ #endif
+ 
+-#define MULTITOUCH_INTERFACE_DESC_POS	AUDIO_INTERFACE_DESC_POS+AUDIO_INTERFACE_DESC_SIZE
++#define AUDIO_INTERFACE_DESC_SIZE_480	8 + 9+9+8+17+12+17+FEATURE_UNIT_DESC_SIZE_480+12 + 9+9+16+6+7+8 + 9+9+16+6+7+8+7
++#define AUDIO_INTERFACE_DESC_SIZE_12  8 + 9+9+8+17+12+17+FEATURE_UNIT_DESC_SIZE_12+12 + 9+9+16+6+7+8 + 9+9+16+6+7+8+7
++#else
++#define AUDIO_INTERFACE_DESC_SIZE_12	0
++#define AUDIO_INTERFACE_DESC_SIZE_480	0
++#endif
++
++#define MULTITOUCH_INTERFACE_DESC_POS_12	AUDIO_INTERFACE_DESC_POS+AUDIO_INTERFACE_DESC_SIZE_12
++#define MULTITOUCH_INTERFACE_DESC_POS_480	AUDIO_INTERFACE_DESC_POS+AUDIO_INTERFACE_DESC_SIZE_480
+ #ifdef  MULTITOUCH_INTERFACE
+ #define MULTITOUCH_INTERFACE_DESC_SIZE	9+9+7
+ #define MULTITOUCH_HID_DESC_OFFSET	MULTITOUCH_INTERFACE_DESC_POS+9
+@@ -649,7 +667,8 @@ static uint8_t microsoft_os_compatible_id_desc[] = {
+ #define MULTITOUCH_INTERFACE_DESC_SIZE	0
+ #endif
+ 
+-#define EXPERIMENTAL_INTERFACE_DESC_POS	MULTITOUCH_INTERFACE_DESC_POS+MULTITOUCH_INTERFACE_DESC_SIZE
++#define EXPERIMENTAL_INTERFACE_DESC_POS_12	MULTITOUCH_INTERFACE_DESC_POS_12+MULTITOUCH_INTERFACE_DESC_SIZE
++#define EXPERIMENTAL_INTERFACE_DESC_POS_480	MULTITOUCH_INTERFACE_DESC_POS_480+MULTITOUCH_INTERFACE_DESC_SIZE
+ #ifdef  EXPERIMENTAL_INTERFACE
+ #define EXPERIMENTAL_INTERFACE_DESC_SIZE 9+7+7
+ #define EXPERIMENTAL_HID_DESC_OFFSET	MULTITOUCH_INTERFACE_DESC_POS+9
+@@ -657,7 +676,8 @@ static uint8_t microsoft_os_compatible_id_desc[] = {
+ #define EXPERIMENTAL_INTERFACE_DESC_SIZE 0
+ #endif
+ 
+-#define CONFIG_DESC_SIZE		EXPERIMENTAL_INTERFACE_DESC_POS+EXPERIMENTAL_INTERFACE_DESC_SIZE
++#define CONFIG_DESC_SIZE_12		EXPERIMENTAL_INTERFACE_DESC_POS_12+EXPERIMENTAL_INTERFACE_DESC_SIZE
++#define CONFIG_DESC_SIZE_480		EXPERIMENTAL_INTERFACE_DESC_POS_480+EXPERIMENTAL_INTERFACE_DESC_SIZE
+ 
+ 
+ 
+@@ -668,12 +688,12 @@ static uint8_t microsoft_os_compatible_id_desc[] = {
+ // USB Configuration Descriptor.  This huge descriptor tells all
+ // of the devices capabilities.
+ 
+-PROGMEM const uint8_t usb_config_descriptor_480[CONFIG_DESC_SIZE] = {
++PROGMEM const uint8_t usb_config_descriptor_480[CONFIG_DESC_SIZE_480] = {
+         // configuration descriptor, USB spec 9.6.3, page 264-266, Table 9-10
+         9,                                      // bLength;
+         2,                                      // bDescriptorType;
+-        LSB(CONFIG_DESC_SIZE),                 // wTotalLength
+-        MSB(CONFIG_DESC_SIZE),
++        LSB(CONFIG_DESC_SIZE_480),                 // wTotalLength
++        MSB(CONFIG_DESC_SIZE_480),
+         NUM_INTERFACE,                          // bNumInterfaces
+         1,                                      // bConfigurationValue
+         0,                                      // iConfiguration
+@@ -911,231 +931,6 @@ PROGMEM const uint8_t usb_config_descriptor_480[CONFIG_DESC_SIZE] = {
+         0,                                      // bInterval
+ #endif // CDC3_DATA_INTERFACE
+ 
+-#ifdef MIDI_INTERFACE
+-	// configuration for 480 Mbit/sec speed
+-        // Standard MS Interface Descriptor,
+-        9,                                      // bLength
+-        4,                                      // bDescriptorType
+-        MIDI_INTERFACE,                         // bInterfaceNumber
+-        0,                                      // bAlternateSetting
+-        2,                                      // bNumEndpoints
+-        0x01,                                   // bInterfaceClass (0x01 = Audio)
+-        0x03,                                   // bInterfaceSubClass (0x03 = MIDI)
+-        0x00,                                   // bInterfaceProtocol (unused for MIDI)
+-        0,                                      // iInterface
+-        // MIDI MS Interface Header, USB MIDI 6.1.2.1, page 21, Table 6-2
+-        7,                                      // bLength
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x01,                                   // bDescriptorSubtype = MS_HEADER
+-        0x00, 0x01,                             // bcdMSC = revision 01.00
+-	LSB(7+(6+6+9+9)*MIDI_NUM_CABLES),       // wTotalLength
+-	MSB(7+(6+6+9+9)*MIDI_NUM_CABLES),
+-        // MIDI IN Jack Descriptor, B.4.3, Table B-7 (embedded), page 40
+-        6,                                      // bLength
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x02,                                   // bDescriptorSubtype = MIDI_IN_JACK
+-        0x01,                                   // bJackType = EMBEDDED
+-        1,                                      // bJackID, ID = 1
+-        0,                                      // iJack
+-        // MIDI IN Jack Descriptor, B.4.3, Table B-8 (external), page 40
+-        6,                                      // bLength
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x02,                                   // bDescriptorSubtype = MIDI_IN_JACK
+-        0x02,                                   // bJackType = EXTERNAL
+-        2,                                      // bJackID, ID = 2
+-        0,                                      // iJack
+-        // MIDI OUT Jack Descriptor, B.4.4, Table B-9, page 41
+-        9,
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x03,                                   // bDescriptorSubtype = MIDI_OUT_JACK
+-        0x01,                                   // bJackType = EMBEDDED
+-        3,                                      // bJackID, ID = 3
+-        1,                                      // bNrInputPins = 1 pin
+-        2,                                      // BaSourceID(1) = 2
+-        1,                                      // BaSourcePin(1) = first pin
+-        0,                                      // iJack
+-        // MIDI OUT Jack Descriptor, B.4.4, Table B-10, page 41
+-        9,
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x03,                                   // bDescriptorSubtype = MIDI_OUT_JACK
+-        0x02,                                   // bJackType = EXTERNAL
+-        4,                                      // bJackID, ID = 4
+-        1,                                      // bNrInputPins = 1 pin
+-        1,                                      // BaSourceID(1) = 1
+-        1,                                      // BaSourcePin(1) = first pin
+-        0,                                      // iJack
+-  #if MIDI_NUM_CABLES >= 2
+-	#define MIDI_INTERFACE_JACK_PAIR(a, b, c, d) \
+-		6, 0x24, 0x02, 0x01, (a), 0, \
+-		6, 0x24, 0x02, 0x02, (b), 0, \
+-		9, 0x24, 0x03, 0x01, (c), 1, (b), 1, 0, \
+-		9, 0x24, 0x03, 0x02, (d), 1, (a), 1, 0,
+-	MIDI_INTERFACE_JACK_PAIR(5, 6, 7, 8)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 3
+-	MIDI_INTERFACE_JACK_PAIR(9, 10, 11, 12)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 4
+-	MIDI_INTERFACE_JACK_PAIR(13, 14, 15, 16)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 5
+-	MIDI_INTERFACE_JACK_PAIR(17, 18, 19, 20)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 6
+-	MIDI_INTERFACE_JACK_PAIR(21, 22, 23, 24)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 7
+-	MIDI_INTERFACE_JACK_PAIR(25, 26, 27, 28)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 8
+-	MIDI_INTERFACE_JACK_PAIR(29, 30, 31, 32)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 9
+-	MIDI_INTERFACE_JACK_PAIR(33, 34, 35, 36)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 10
+-	MIDI_INTERFACE_JACK_PAIR(37, 38, 39, 40)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 11
+-	MIDI_INTERFACE_JACK_PAIR(41, 42, 43, 44)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 12
+-	MIDI_INTERFACE_JACK_PAIR(45, 46, 47, 48)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 13
+-	MIDI_INTERFACE_JACK_PAIR(49, 50, 51, 52)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 14
+-	MIDI_INTERFACE_JACK_PAIR(53, 54, 55, 56)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 15
+-	MIDI_INTERFACE_JACK_PAIR(57, 58, 59, 60)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 16
+-	MIDI_INTERFACE_JACK_PAIR(61, 62, 63, 64)
+-  #endif
+-        // Standard Bulk OUT Endpoint Descriptor, B.5.1, Table B-11, pae 42
+-        9,                                      // bLength
+-        5,                                      // bDescriptorType = ENDPOINT
+-        MIDI_RX_ENDPOINT,                       // bEndpointAddress
+-        0x02,                                   // bmAttributes (0x02=bulk)
+-        LSB(MIDI_RX_SIZE_480),MSB(MIDI_RX_SIZE_480),// wMaxPacketSize
+-        0,                                      // bInterval
+-        0,                                      // bRefresh
+-        0,                                      // bSynchAddress
+-        // Class-specific MS Bulk OUT Endpoint Descriptor, B.5.2, Table B-12, page 42
+-        4+MIDI_NUM_CABLES,                      // bLength
+-        0x25,                                   // bDescriptorSubtype = CS_ENDPOINT
+-        0x01,                                   // bJackType = MS_GENERAL
+-        MIDI_NUM_CABLES,                        // bNumEmbMIDIJack = number of jacks
+-        1,                                      // BaAssocJackID(1) = jack ID #1
+-  #if MIDI_NUM_CABLES >= 2
+-        5,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 3
+-        9,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 4
+-        13,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 5
+-        17,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 6
+-        21,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 7
+-        25,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 8
+-        29,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 9
+-        33,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 10
+-        37,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 11
+-        41,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 12
+-        45,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 13
+-        49,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 14
+-        53,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 15
+-        57,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 16
+-        61,
+-  #endif
+-        // Standard Bulk IN Endpoint Descriptor, B.5.1, Table B-11, pae 42
+-        9,                                      // bLength
+-        5,                                      // bDescriptorType = ENDPOINT
+-        MIDI_TX_ENDPOINT | 0x80,                // bEndpointAddress
+-        0x02,                                   // bmAttributes (0x02=bulk)
+-        LSB(MIDI_TX_SIZE_480),MSB(MIDI_TX_SIZE_480),// wMaxPacketSize
+-        0,                                      // bInterval
+-        0,                                      // bRefresh
+-        0,                                      // bSynchAddress
+-        // Class-specific MS Bulk IN Endpoint Descriptor, B.5.2, Table B-12, page 42
+-        4+MIDI_NUM_CABLES,                      // bLength
+-        0x25,                                   // bDescriptorSubtype = CS_ENDPOINT
+-        0x01,                                   // bJackType = MS_GENERAL
+-        MIDI_NUM_CABLES,                        // bNumEmbMIDIJack = number of jacks
+-        3,                                      // BaAssocJackID(1) = jack ID #3
+-  #if MIDI_NUM_CABLES >= 2
+-        7,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 3
+-        11,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 4
+-        15,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 5
+-        19,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 6
+-        23,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 7
+-        27,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 8
+-        31,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 9
+-        35,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 10
+-        39,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 11
+-        43,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 12
+-        47,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 13
+-        51,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 14
+-        55,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 15
+-        59,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 16
+-        63,
+-  #endif
+-#endif // MIDI_INTERFACE
+-
+ #ifdef KEYBOARD_INTERFACE
+ 	// configuration for 480 Mbit/sec speed
+         // interface descriptor, USB spec 9.6.5, page 267-269, Table 9-12
+@@ -1403,98 +1198,140 @@ PROGMEM const uint8_t usb_config_descriptor_480[CONFIG_DESC_SIZE] = {
+ #endif // KEYMEDIA_INTERFACE
+ 
+ #ifdef AUDIO_INTERFACE
+-	// configuration for 480 Mbit/sec speed
+-        // interface association descriptor, USB ECN, Table 9-Z
++      // UAC2: 
++      // Standard Interface Association Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.6, Table 4-3 page 46
+         8,                                      // bLength
+         11,                                     // bDescriptorType
+         AUDIO_INTERFACE,                        // bFirstInterface
+         3,                                      // bInterfaceCount
+         0x01,                                   // bFunctionClass
+-        0x01,                                   // bFunctionSubClass
+-        0x00,                                   // bFunctionProtocol
++        0x00,                                   // bFunctionSubClass, 0x00 = FUNCTION_SUBCLASS_UNDEFINED
++        0x20,                                   // bFunctionProtocol 0x20 = IP_VERSION_02_00 = AF_VERSION_02_00
+         0,                                      // iFunction
+-	// Standard AudioControl (AC) Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-1, page 36
+-	9,					// bLength
++	// UAC2:: 
++      // Standard AudioControl (AC) Interface Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.1, Table 4-4 page 47
++      9,					// bLength
+ 	4,					// bDescriptorType, 4 = INTERFACE
+ 	AUDIO_INTERFACE,			// bInterfaceNumber
+ 	0,					// bAlternateSetting
+ 	0,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	1,					// bInterfaceSubclass, 1 = AUDIO_CONTROL
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol, IP_VERSION_02_00==0x20
+ 	0,					// iInterface
+-	// Class-specific AC Interface Header Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-2, page 37-38
+-	10,					// bLength
++	// UAC2: 
++      // Input Terminal Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2, Table 4-5 page 48-49
++      9,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+ 	0x01,					// bDescriptorSubtype, 1 = HEADER
+-	0x00, 0x01,				// bcdADC (version 1.0)
+-	LSB(62), MSB(62),			// wTotalLength
+-	2,					// bInCollection
+-	AUDIO_INTERFACE+1,			// baInterfaceNr(1) - Transmit to PC
+-	AUDIO_INTERFACE+2,			// baInterfaceNr(2) - Receive from PC
+-	// Input Terminal Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-3, page 39
+-	12,					// bLength
++	0x00, 0x02,				// bcdADC (version 2.0)
++      0xff,                         // bCategory 0xff = other
++      LSB(75+FEATURE_UNIT_DESC_SIZE_480), MSB(75+FEATURE_UNIT_DESC_SIZE_480),// wTotalLength: size of this descriptor + all input and output and feature unit descriptors + clock sources
++      0,                            // bmControls
++	// UAC2: 
++      // Clock Source Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.1, Table 4-9 page 49-50
++      8,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+-	0x02,					// bDescriptorSubType, 2 = INPUT_TERMINAL
++	0x0a,					// bDescriptorSubType, 2 = CLOCK_SOURCE
++	0x3a,					// bClockID
++	0x01, 				// Internal fixed clock, not synchronized to SOF
++	1 | 4,			      // bmControls: 1: clock frequency control is read only, 4 clock validity control is read only 
++	0,                            // bAssocTerminal
++      0,		                  // iClockSource
++	// UAC2: 
++      // Input Terminal Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.4, Table 4-9 page 52-53
++      17,					// bLength
++	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
++	2,					// bDescriptorSubType, 2 = INPUT_TERMINAL
+ 	1,					// bTerminalID
+-	//0x01, 0x02,				// wTerminalType, 0x0201 = MICROPHONE
+-	//0x03, 0x06,				// wTerminalType, 0x0603 = Line Connector
+ 	0x02, 0x06,				// wTerminalType, 0x0602 = Digital Audio
+ 	0,					// bAssocTerminal, 0 = unidirectional
+-	2,					// bNrChannels
+-	0x03, 0x00,				// wChannelConfig, 0x0003 = Left & Right Front
+-	0,					// iChannelNames
++	0x3a,                         // bCSourceID
++      USB_AUDIO_NO_CHANNELS_480,		// bNrChannels
++      LSB(CHANNEL_CONFIG_480),             // bmChannelConfig
++      MSB(CHANNEL_CONFIG_480),             // bmChannelConfig
++      (((CHANNEL_CONFIG_480) >> 16) & 255),// bmChannelConfig
++      (((CHANNEL_CONFIG_480) >> 24) & 255),// bmChannelConfig
++	0x00,                         // iChannelNames
++      0x00, 0x00,				// bmControls e.g. copy protect readable and writeable
+ 	0, 					// iTerminal
+-	// Output Terminal Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-4, page 40
+-	9,					// bLength
++	// UAC2: 
++      // Output Terminal Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.5, Table 4-10 page 53
++      12,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+ 	3,					// bDescriptorSubtype, 3 = OUTPUT_TERMINAL
+ 	2,					// bTerminalID
+ 	0x01, 0x01,				// wTerminalType, 0x0101 = USB_STREAMING
+ 	0,					// bAssocTerminal, 0 = unidirectional
+-	1,					// bCSourceID, connected to input terminal, ID=1
+-	0,					// iTerminal
+-	// Input Terminal Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-3, page 39
+-	12,					// bLength
++	1,				      // bSourceID, connected to feature, ID=1
++	0x3a,					// bCSourceID
++      0,0,					// bmControls
++      0,					// iTerminal
++      // UAC2: 
++      // Input Terminal Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.4, Table 4-9 page 52-53
++      17,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+ 	2,					// bDescriptorSubType, 2 = INPUT_TERMINAL
+ 	3,					// bTerminalID
+ 	0x01, 0x01,				// wTerminalType, 0x0101 = USB_STREAMING
+ 	0,					// bAssocTerminal, 0 = unidirectional
+-	2,					// bNrChannels
+-	0x03, 0x00,				// wChannelConfig, 0x0003 = Left & Right Front
+-	0,					// iChannelNames
++	0x3a,                           // bCSourceID
++      USB_AUDIO_NO_CHANNELS_480,		// bNrChannels
++      LSB(CHANNEL_CONFIG_480),             // bmChannelConfig
++      MSB(CHANNEL_CONFIG_480),             // bmChannelConfig
++      (((CHANNEL_CONFIG_480) >> 16) & 255),// bmChannelConfig
++      (((CHANNEL_CONFIG_480) >> 24) & 255),// bmChannelConfig
++	0x00,                         // iChannelNames
++      0x00, 0x00,				// bmControls e.g.: copy protect readable and writeable
+ 	0, 					// iTerminal
+-	// Volume feature descriptor
+-	10,					// bLength
++	// UAC2: 
++      // Feature Unit Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.8, Table 4-13 page 58-59
++	FEATURE_UNIT_DESC_SIZE_480,	// bLength
+ 	0x24, 				// bDescriptorType = CS_INTERFACE
+ 	0x06, 				// bDescriptorSubType = FEATURE_UNIT
+ 	0x31, 				// bUnitID
+ 	0x03, 				// bSourceID (Input Terminal)
+-	0x01, 				// bControlSize (each channel is 1 byte, 3 channels)
+-	0x01, 				// bmaControls(0) Master: Mute
+-	0x02, 				// bmaControls(1) Left: Volume
+-	0x02, 				// bmaControls(2) Right: Volume
+-	0x00,				// iFeature
+-	// Output Terminal Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-4, page 40
+-	9,					// bLength
++	15,0x00,0x00,0x00,		// bmaControls(0) Master: Mute   bit 0 and 1 + bit 2 + 3 (reading and writing master volume)
++	12,0x00,0x00,0x00,		// bmaControls(1) Left: Volume   bit 2 and 3   
++	12,0x00,0x00,0x00,		// bmaControls(2) Right: Volume  bit 2 and 3
++#if USB_AUDIO_NO_CHANNELS_480 > 2
++	12,0x00,0x00,0x00,		// bmaControls(1) channel 3: Volume   bit 2 and 3   
++	12,0x00,0x00,0x00,		// bmaControls(2) channel 4: Volume  bit 2 and 3
++#endif
++#if USB_AUDIO_NO_CHANNELS_480 > 4
++	12,0x00,0x00,0x00,		// bmaControls(1) channel 5: Volume   bit 2 and 3   
++	12,0x00,0x00,0x00,		// bmaControls(2) channel 6: Volume  bit 2 and 3
++#endif
++#if USB_AUDIO_NO_CHANNELS_480 > 6
++	12,0x00,0x00,0x00,		// bmaControls(1) channel 7: Volume   bit 2 and 3   
++	12,0x00,0x00,0x00,		// bmaControls(2) channel 8: Volume  bit 2 and 3
++#endif
++      0x00,				      // iFeature
++	// UAC2: 
++      // Output Terminal Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.5, Table 4-10 page 53
++      12,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+ 	3,					// bDescriptorSubtype, 3 = OUTPUT_TERMINAL
+ 	4,					// bTerminalID
+-	//0x02, 0x03,				// wTerminalType, 0x0302 = Headphones
+-	0x02, 0x06,				// wTerminalType, 0x0602 = Digital Audio
++	0x02, 0x06,				// wTerminalType, 0x0602 = Digital Audio 
+ 	0,					// bAssocTerminal, 0 = unidirectional
+-	0x31,				// bCSourceID, connected to feature, ID=31
+-	0,					// iTerminal
+-	// Standard AS Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.5.1, Table 4-18, page 59
+-	// Alternate 0: default setting, disabled zero bandwidth
++	0x31,				      // bSourceID, connected to feature, ID=31
++	0x3a,					// bCSourceID
++      0,0,					// bmControls
++      0,					// iTerminal
++	// UAC2: 
++      // Standard AS Interface Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.9.1, Table 4-26 page 75
++      // Alternate 0: default setting, disabled zero bandwidth
+ 	9,					// bLenght
+ 	4,					// bDescriptorType = INTERFACE
+ 	AUDIO_INTERFACE+1,			// bInterfaceNumber
+@@ -1502,58 +1339,69 @@ PROGMEM const uint8_t usb_config_descriptor_480[CONFIG_DESC_SIZE] = {
+ 	0,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	2,					// bInterfaceSubclass, 2 = AUDIO_STREAMING
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol IP_VERSION_02_00==0x20
+ 	0,					// iInterface
+ 	// Alternate 1: streaming data
+ 	9,					// bLenght
+ 	4,					// bDescriptorType = INTERFACE
+-	AUDIO_INTERFACE+1,			// bInterfaceNumber
++	AUDIO_INTERFACE+1,		// bInterfaceNumber
+ 	1,					// bAlternateSetting
+ 	1,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	2,					// bInterfaceSubclass, 2 = AUDIO_STREAMING
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol IP_VERSION_02_00==0x20
+ 	0,					// iInterface
+-	// Class-Specific AS Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.5.2, Table 4-19, page 60
+-	7, 					// bLength
++	// UAC2: 
++      // Class-Specific AS Interface Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.9.2, Table 4-27 page 75-77
++      16, 					// bLength
+ 	0x24,					// bDescriptorType = CS_INTERFACE
+ 	1,					// bDescriptorSubtype, 1 = AS_GENERAL
+ 	2,					// bTerminalLink: Terminal ID = 2
+-	3,					// bDelay (approx 3ms delay, audio lib updates)
+-	0x01, 0x00,				// wFormatTag, 0x0001 = PCM
+-	// Type I Format Descriptor
+-	// USB DCD for Audio Data Formats 1.0, Section 2.2.5, Table 2-1, page 10
+-	11,					// bLength
++	0,                            // bmControls
++      1,                            // bFormatType 1=FORMAT_TYPE_I
++      0x01, 0x00, 0x00, 0x00,       // bmFormats first bit: PCM
++      USB_AUDIO_NO_CHANNELS_480,           // bNrChannels
++      LSB(CHANNEL_CONFIG_480),             // bmChannelConfig
++      MSB(CHANNEL_CONFIG_480),             // bmChannelConfig
++      (((CHANNEL_CONFIG_480) >> 16) & 255),// bmChannelConfig
++      (((CHANNEL_CONFIG_480) >> 24) & 255),// bmChannelConfig
++      0,                            //iChannelNames   index of string descriptor at the bottom of the file
++      // UAC2: 
++      // Univeral Serial Bus Device Class Definition for Audio Data Formats 2.0, Section 2.3.1.6, Table 2-2, page 15-16
++      6,					// bLength
+ 	0x24,					// bDescriptorType = CS_INTERFACE
+ 	2,					// bDescriptorSubtype = FORMAT_TYPE
+ 	1,					// bFormatType = FORMAT_TYPE_I
+-	2,					// bNrChannels = 2
+-	2,					// bSubFrameSize = 2 byte
+-	16,					// bBitResolution = 16 bits
+-	1,					// bSamFreqType = 1 frequency
+-	LSB(44100), MSB(44100), 0,		// tSamFreq
++	AUDIO_SUBSLOT_SIZE,		// bSubSlotSize = size of a single sample in bytes (e.g. 2 bytes for 16bit audio)
++	AUDIO_BITRESOLUTION,		// bBitResolution = 16 bits
++	// UAC2: 
+ 	// Standard AS Isochronous Audio Data Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.1.1, Table 4-20, page 61-62
+-	9, 					// bLength
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.1.1, Table 4-33 page 85-86
++	7, 					// bLength
+ 	5, 					// bDescriptorType, 5 = ENDPOINT_DESCRIPTOR
+-	AUDIO_TX_ENDPOINT | 0x80,		// bEndpointAddress
+-	0x09, 					// bmAttributes = isochronous, adaptive
+-	LSB(AUDIO_TX_SIZE), MSB(AUDIO_TX_SIZE),	// wMaxPacketSize
+-	4,			 		// bInterval, 4 = every 8 micro-frames
+-	0,					// bRefresh
+-	0,					// bSynchAddress
+-	// Class-Specific AS Isochronous Audio Data Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.1.2, Table 4-21, page 62-63
+-	7,  					// bLength
++	AUDIO_TX_ENDPOINT | 0x80,			// bEndpointAddress (0x80 = 10000000 -> audio source)
++#ifdef ASYNC_TX_ENDPOINT
++	0x05, 				// bmAttributes, 0x09 = isochronous, adaptive, 0x05 = isochronous, asynchronous
++#elif
++      0x09,                         // bmAttributes, 0x09 = isochronous, adaptive, 0x05 = isochronous, asynchronous
++#endif
++	LSB(AUDIO_TX_SIZE_480), MSB(AUDIO_TX_SIZE_480),	// wMaxPacketSize
++	AUDIO_POLLING_INTERVAL_480,			 	// bInterval, 4 -> 2^(4-1)=8 -> every 8 micro-frames
++      // UAC2: 
++      // Class-Specific AS Isochronous Audio Data Endpoint Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.1.2, Table 4-34 page 86-87
++      8,  					// bLength
+ 	0x25,  					// bDescriptorType, 0x25 = CS_ENDPOINT
+ 	1,  					// bDescriptorSubtype, 1 = EP_GENERAL
+ 	0x00,  					// bmAttributes
++	0x00,  					// bmControls
+ 	0,  					// bLockDelayUnits, 1 = ms
+ 	0x00, 0x00,  				// wLockDelay
+-	// Standard AS Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.5.1, Table 4-18, page 59
+-	// Alternate 0: default setting, disabled zero bandwidth
++	// UAC2: 
++      // Standard AS Interface Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.9.1, Table 4-26 page 75
++      // Alternate 0: default setting, disabled zero bandwidth
+ 	9,					// bLenght
+ 	4,					// bDescriptorType = INTERFACE
+ 	AUDIO_INTERFACE+2,			// bInterfaceNumber
+@@ -1561,7 +1409,7 @@ PROGMEM const uint8_t usb_config_descriptor_480[CONFIG_DESC_SIZE] = {
+ 	0,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	2,					// bInterfaceSubclass, 2 = AUDIO_STREAMING
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol IP_VERSION_02_00==0x20
+ 	0,					// iInterface
+ 	// Alternate 1: streaming data
+ 	9,					// bLenght
+@@ -1571,57 +1419,287 @@ PROGMEM const uint8_t usb_config_descriptor_480[CONFIG_DESC_SIZE] = {
+ 	2,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	2,					// bInterfaceSubclass, 2 = AUDIO_STREAMING
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol IP_VERSION_02_00==0x20
+ 	0,					// iInterface
+-	// Class-Specific AS Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.5.2, Table 4-19, page 60
+-	7, 					// bLength
++	// UAC2: 
++      // Class-Specific AS Interface Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.9.2, Table 4-27 page 75-77
++      16, 					// bLength
+ 	0x24,					// bDescriptorType = CS_INTERFACE
+ 	1,					// bDescriptorSubtype, 1 = AS_GENERAL
+ 	3,					// bTerminalLink: Terminal ID = 3
+-	3,					// bDelay (approx 3ms delay, audio lib updates)
+-	0x01, 0x00,				// wFormatTag, 0x0001 = PCM
+-	// Type I Format Descriptor
+-	// USB DCD for Audio Data Formats 1.0, Section 2.2.5, Table 2-1, page 10
+-	11,					// bLength
++	0,                            //bmControls
++      1,                            //bFormatType 1=FORMAT_TYPE_I
++      0x01, 0x00, 0x00, 0x00,       //bmFormats first bit: PCM
++ 	USB_AUDIO_NO_CHANNELS_480,           // bNrChannels
++      LSB(CHANNEL_CONFIG_480),             // bmChannelConfig
++      MSB(CHANNEL_CONFIG_480),             // bmChannelConfig
++      (((CHANNEL_CONFIG_480) >> 16) & 255),// bmChannelConfig
++      (((CHANNEL_CONFIG_480) >> 24) & 255),// bmChannelConfig
++      0,                                   //iChannelNames   index of string descriptor at the bottom of the file
++	// UAC2: 
++      // Univeral Serial Bus Device Class Definition for Audio Data Formats 2.0, Section 2.3.1.6, Table 2-2, page 15-16
++      6,					// bLength
+ 	0x24,					// bDescriptorType = CS_INTERFACE
+ 	2,					// bDescriptorSubtype = FORMAT_TYPE
+ 	1,					// bFormatType = FORMAT_TYPE_I
+-	2,					// bNrChannels = 2
+-	2,					// bSubFrameSize = 2 byte
+-	16,					// bBitResolution = 16 bits
+-	1,					// bSamFreqType = 1 frequency
+-	LSB(44100), MSB(44100), 0,		// tSamFreq
+-	// Standard AS Isochronous Audio Data Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.1.1, Table 4-20, page 61-62
+-	9, 					// bLength
++	AUDIO_SUBSLOT_SIZE,		// bSubSlotSize = size of a single sample in bytes (e.g. 2 bytes for 16bit audio)
++	AUDIO_BITRESOLUTION,		// bBitResolution = 16 bits
++	// UAC2: 
++      // Standard AS Isochronous Audio Data Endpoint Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.1.1, Table 4-33 page 85-86
++	7, 					// bLength
+ 	5, 					// bDescriptorType, 5 = ENDPOINT_DESCRIPTOR
+-	AUDIO_RX_ENDPOINT,			// bEndpointAddress
++	AUDIO_RX_ENDPOINT | 0x00,		// bEndpointAddress  (0x00 = 00000000 -> audio sink)
+ 	0x05, 					// bmAttributes = isochronous, asynchronous
+-	LSB(AUDIO_RX_SIZE), MSB(AUDIO_RX_SIZE),	// wMaxPacketSize
+-	4,			 		// bInterval, 4 = every 8 micro-frames
+-	0,					// bRefresh
+-	AUDIO_SYNC_ENDPOINT | 0x80,		// bSynchAddress
+-	// Class-Specific AS Isochronous Audio Data Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.1.2, Table 4-21, page 62-63
+-	7,  					// bLength
+-	0x25,  					// bDescriptorType, 0x25 = CS_ENDPOINT
++	LSB(AUDIO_RX_SIZE_480), MSB(AUDIO_RX_SIZE_480),	// wMaxPacketSize
++	AUDIO_POLLING_INTERVAL_480,			 	// bInterval, 4 -> 2^(4-1)=8 -> every 8 micro-frames
++	// UAC2: 
++      // Class-Specific AS Isochronous Audio Data Endpoint Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.1.2, Table 4-34 page 86-87
++      8,  					// bLength
++	0x25,  				// bDescriptorType, 0x25 = CS_ENDPOINT
+ 	1,  					// bDescriptorSubtype, 1 = EP_GENERAL
+-	0x00,  					// bmAttributes
++	0x00,  				// bmAttributes
++	0x00,  				// bmControls
+ 	0,  					// bLockDelayUnits, 1 = ms
+-	0x00, 0x00,  				// wLockDelay
+-	// Standard AS Isochronous Audio Synch Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.2.1, Table 4-22, page 63-64
+-	9, 					// bLength
++	0x00, 0x00,  			// wLockDelay
++	// UAC2: 
++      // Standard AS Isochronous Feedback Endpoint Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.2.1, Table 4-35 page 87-88
++      7, 					// bLength
+ 	5, 					// bDescriptorType, 5 = ENDPOINT_DESCRIPTOR
+-	AUDIO_SYNC_ENDPOINT | 0x80,		// bEndpointAddress
++	AUDIO_SYNC_ENDPOINT | 0x80,		// bEndpointAddress, 0x80=10000000 -> IN endpoint
+ 	0x11, 					// bmAttributes = isochronous, feedback
+ 	4, 0,					// wMaxPacketSize, 4 bytes
+-	4,			 		// bInterval, 4 = 4 = every 8 micro-frames
+-	7,					// bRefresh,
+-	0,					// bSynchAddress
++	AUDIO_POLLING_INTERVAL_480,		// bInterval, 4 -> 2^(4-1) = 8 -> every 8 micro-frames
+ #endif
+ 
++#ifdef MIDI_INTERFACE
++	// configuration for 480 Mbit/sec speed
++        // Standard MS Interface Descriptor,
++        9,                                      // bLength
++        4,                                      // bDescriptorType
++        MIDI_INTERFACE,                         // bInterfaceNumber
++        0,                                      // bAlternateSetting
++        2,                                      // bNumEndpoints
++        0x01,                                   // bInterfaceClass (0x01 = Audio)
++        0x03,                                   // bInterfaceSubClass (0x03 = MIDI)
++        0x00,                                   // bInterfaceProtocol (unused for MIDI)
++        0,                                      // iInterface
++        // MIDI MS Interface Header, USB MIDI 6.1.2.1, page 21, Table 6-2
++        7,                                      // bLength
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x01,                                   // bDescriptorSubtype = MS_HEADER
++        0x00, 0x01,                             // bcdMSC = revision 01.00
++	LSB(7+(6+6+9+9)*MIDI_NUM_CABLES),       // wTotalLength
++	MSB(7+(6+6+9+9)*MIDI_NUM_CABLES),
++        // MIDI IN Jack Descriptor, B.4.3, Table B-7 (embedded), page 40
++        6,                                      // bLength
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x02,                                   // bDescriptorSubtype = MIDI_IN_JACK
++        0x01,                                   // bJackType = EMBEDDED
++        1,                                      // bJackID, ID = 1
++        0,                                      // iJack
++        // MIDI IN Jack Descriptor, B.4.3, Table B-8 (external), page 40
++        6,                                      // bLength
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x02,                                   // bDescriptorSubtype = MIDI_IN_JACK
++        0x02,                                   // bJackType = EXTERNAL
++        2,                                      // bJackID, ID = 2
++        0,                                      // iJack
++        // MIDI OUT Jack Descriptor, B.4.4, Table B-9, page 41
++        9,
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x03,                                   // bDescriptorSubtype = MIDI_OUT_JACK
++        0x01,                                   // bJackType = EMBEDDED
++        3,                                      // bJackID, ID = 3
++        1,                                      // bNrInputPins = 1 pin
++        2,                                      // BaSourceID(1) = 2
++        1,                                      // BaSourcePin(1) = first pin
++        0,                                      // iJack
++        // MIDI OUT Jack Descriptor, B.4.4, Table B-10, page 41
++        9,
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x03,                                   // bDescriptorSubtype = MIDI_OUT_JACK
++        0x02,                                   // bJackType = EXTERNAL
++        4,                                      // bJackID, ID = 4
++        1,                                      // bNrInputPins = 1 pin
++        1,                                      // BaSourceID(1) = 1
++        1,                                      // BaSourcePin(1) = first pin
++        0,                                      // iJack
++  #if MIDI_NUM_CABLES >= 2
++	#define MIDI_INTERFACE_JACK_PAIR(a, b, c, d) \
++		6, 0x24, 0x02, 0x01, (a), 0, \
++		6, 0x24, 0x02, 0x02, (b), 0, \
++		9, 0x24, 0x03, 0x01, (c), 1, (b), 1, 0, \
++		9, 0x24, 0x03, 0x02, (d), 1, (a), 1, 0,
++	MIDI_INTERFACE_JACK_PAIR(5, 6, 7, 8)
++  #endif
++  #if MIDI_NUM_CABLES >= 3
++	MIDI_INTERFACE_JACK_PAIR(9, 10, 11, 12)
++  #endif
++  #if MIDI_NUM_CABLES >= 4
++	MIDI_INTERFACE_JACK_PAIR(13, 14, 15, 16)
++  #endif
++  #if MIDI_NUM_CABLES >= 5
++	MIDI_INTERFACE_JACK_PAIR(17, 18, 19, 20)
++  #endif
++  #if MIDI_NUM_CABLES >= 6
++	MIDI_INTERFACE_JACK_PAIR(21, 22, 23, 24)
++  #endif
++  #if MIDI_NUM_CABLES >= 7
++	MIDI_INTERFACE_JACK_PAIR(25, 26, 27, 28)
++  #endif
++  #if MIDI_NUM_CABLES >= 8
++	MIDI_INTERFACE_JACK_PAIR(29, 30, 31, 32)
++  #endif
++  #if MIDI_NUM_CABLES >= 9
++	MIDI_INTERFACE_JACK_PAIR(33, 34, 35, 36)
++  #endif
++  #if MIDI_NUM_CABLES >= 10
++	MIDI_INTERFACE_JACK_PAIR(37, 38, 39, 40)
++  #endif
++  #if MIDI_NUM_CABLES >= 11
++	MIDI_INTERFACE_JACK_PAIR(41, 42, 43, 44)
++  #endif
++  #if MIDI_NUM_CABLES >= 12
++	MIDI_INTERFACE_JACK_PAIR(45, 46, 47, 48)
++  #endif
++  #if MIDI_NUM_CABLES >= 13
++	MIDI_INTERFACE_JACK_PAIR(49, 50, 51, 52)
++  #endif
++  #if MIDI_NUM_CABLES >= 14
++	MIDI_INTERFACE_JACK_PAIR(53, 54, 55, 56)
++  #endif
++  #if MIDI_NUM_CABLES >= 15
++	MIDI_INTERFACE_JACK_PAIR(57, 58, 59, 60)
++  #endif
++  #if MIDI_NUM_CABLES >= 16
++	MIDI_INTERFACE_JACK_PAIR(61, 62, 63, 64)
++  #endif
++        // Standard Bulk OUT Endpoint Descriptor, B.5.1, Table B-11, pae 42
++        9,                                      // bLength
++        5,                                      // bDescriptorType = ENDPOINT
++        MIDI_RX_ENDPOINT,                       // bEndpointAddress
++        0x02,                                   // bmAttributes (0x02=bulk)
++        LSB(MIDI_RX_SIZE_480),MSB(MIDI_RX_SIZE_480),// wMaxPacketSize
++        0,                                      // bInterval
++        0,                                      // bRefresh
++        0,                                      // bSynchAddress
++        // Class-specific MS Bulk OUT Endpoint Descriptor, B.5.2, Table B-12, page 42
++        4+MIDI_NUM_CABLES,                      // bLength
++        0x25,                                   // bDescriptorSubtype = CS_ENDPOINT
++        0x01,                                   // bJackType = MS_GENERAL
++        MIDI_NUM_CABLES,                        // bNumEmbMIDIJack = number of jacks
++        1,                                      // BaAssocJackID(1) = jack ID #1
++  #if MIDI_NUM_CABLES >= 2
++        5,
++  #endif
++  #if MIDI_NUM_CABLES >= 3
++        9,
++  #endif
++  #if MIDI_NUM_CABLES >= 4
++        13,
++  #endif
++  #if MIDI_NUM_CABLES >= 5
++        17,
++  #endif
++  #if MIDI_NUM_CABLES >= 6
++        21,
++  #endif
++  #if MIDI_NUM_CABLES >= 7
++        25,
++  #endif
++  #if MIDI_NUM_CABLES >= 8
++        29,
++  #endif
++  #if MIDI_NUM_CABLES >= 9
++        33,
++  #endif
++  #if MIDI_NUM_CABLES >= 10
++        37,
++  #endif
++  #if MIDI_NUM_CABLES >= 11
++        41,
++  #endif
++  #if MIDI_NUM_CABLES >= 12
++        45,
++  #endif
++  #if MIDI_NUM_CABLES >= 13
++        49,
++  #endif
++  #if MIDI_NUM_CABLES >= 14
++        53,
++  #endif
++  #if MIDI_NUM_CABLES >= 15
++        57,
++  #endif
++  #if MIDI_NUM_CABLES >= 16
++        61,
++  #endif
++        // Standard Bulk IN Endpoint Descriptor, B.5.1, Table B-11, pae 42
++        9,                                      // bLength
++        5,                                      // bDescriptorType = ENDPOINT
++        MIDI_TX_ENDPOINT | 0x80,                // bEndpointAddress
++        0x02,                                   // bmAttributes (0x02=bulk)
++        LSB(MIDI_TX_SIZE_480),MSB(MIDI_TX_SIZE_480),// wMaxPacketSize
++        0,                                      // bInterval
++        0,                                      // bRefresh
++        0,                                      // bSynchAddress
++        // Class-specific MS Bulk IN Endpoint Descriptor, B.5.2, Table B-12, page 42
++        4+MIDI_NUM_CABLES,                      // bLength
++        0x25,                                   // bDescriptorSubtype = CS_ENDPOINT
++        0x01,                                   // bJackType = MS_GENERAL
++        MIDI_NUM_CABLES,                        // bNumEmbMIDIJack = number of jacks
++        3,                                      // BaAssocJackID(1) = jack ID #3
++  #if MIDI_NUM_CABLES >= 2
++        7,
++  #endif
++  #if MIDI_NUM_CABLES >= 3
++        11,
++  #endif
++  #if MIDI_NUM_CABLES >= 4
++        15,
++  #endif
++  #if MIDI_NUM_CABLES >= 5
++        19,
++  #endif
++  #if MIDI_NUM_CABLES >= 6
++        23,
++  #endif
++  #if MIDI_NUM_CABLES >= 7
++        27,
++  #endif
++  #if MIDI_NUM_CABLES >= 8
++        31,
++  #endif
++  #if MIDI_NUM_CABLES >= 9
++        35,
++  #endif
++  #if MIDI_NUM_CABLES >= 10
++        39,
++  #endif
++  #if MIDI_NUM_CABLES >= 11
++        43,
++  #endif
++  #if MIDI_NUM_CABLES >= 12
++        47,
++  #endif
++  #if MIDI_NUM_CABLES >= 13
++        51,
++  #endif
++  #if MIDI_NUM_CABLES >= 14
++        55,
++  #endif
++  #if MIDI_NUM_CABLES >= 15
++        59,
++  #endif
++  #if MIDI_NUM_CABLES >= 16
++        63,
++  #endif
++#endif // MIDI_INTERFACE
++
+ #ifdef MULTITOUCH_INTERFACE
+ 	// configuration for 480 Mbit/sec speed
+         // interface descriptor, USB spec 9.6.5, page 267-269, Table 9-12
+@@ -1682,12 +1760,12 @@ PROGMEM const uint8_t usb_config_descriptor_480[CONFIG_DESC_SIZE] = {
+ };
+ 
+ 
+-PROGMEM const uint8_t usb_config_descriptor_12[CONFIG_DESC_SIZE] = {
++PROGMEM const uint8_t usb_config_descriptor_12[CONFIG_DESC_SIZE_12] = {
+         // configuration descriptor, USB spec 9.6.3, page 264-266, Table 9-10
+         9,                                      // bLength;
+         2,                                      // bDescriptorType;
+-        LSB(CONFIG_DESC_SIZE),                 // wTotalLength
+-        MSB(CONFIG_DESC_SIZE),
++        LSB(CONFIG_DESC_SIZE_12),                 // wTotalLength
++        MSB(CONFIG_DESC_SIZE_12),
+         NUM_INTERFACE,                          // bNumInterfaces
+         1,                                      // bConfigurationValue
+         0,                                      // iConfiguration
+@@ -1920,235 +1998,10 @@ PROGMEM const uint8_t usb_config_descriptor_12[CONFIG_DESC_SIZE] = {
+         7,                                      // bLength
+         5,                                      // bDescriptorType
+         CDC3_TX_ENDPOINT | 0x80,                // bEndpointAddress
+-        0x02,                                   // bmAttributes (0x02=bulk)
+-        CDC_TX_SIZE_12, 0,                      // wMaxPacketSize
+-        0,                                      // bInterval
+-#endif // CDC3_DATA_INTERFACE
+-
+-#ifdef MIDI_INTERFACE
+-	// configuration for 12 Mbit/sec speed
+-        // Standard MS Interface Descriptor,
+-        9,                                      // bLength
+-        4,                                      // bDescriptorType
+-        MIDI_INTERFACE,                         // bInterfaceNumber
+-        0,                                      // bAlternateSetting
+-        2,                                      // bNumEndpoints
+-        0x01,                                   // bInterfaceClass (0x01 = Audio)
+-        0x03,                                   // bInterfaceSubClass (0x03 = MIDI)
+-        0x00,                                   // bInterfaceProtocol (unused for MIDI)
+-        0,                                      // iInterface
+-        // MIDI MS Interface Header, USB MIDI 6.1.2.1, page 21, Table 6-2
+-        7,                                      // bLength
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x01,                                   // bDescriptorSubtype = MS_HEADER
+-        0x00, 0x01,                             // bcdMSC = revision 01.00
+-	LSB(7+(6+6+9+9)*MIDI_NUM_CABLES),       // wTotalLength
+-	MSB(7+(6+6+9+9)*MIDI_NUM_CABLES),
+-        // MIDI IN Jack Descriptor, B.4.3, Table B-7 (embedded), page 40
+-        6,                                      // bLength
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x02,                                   // bDescriptorSubtype = MIDI_IN_JACK
+-        0x01,                                   // bJackType = EMBEDDED
+-        1,                                      // bJackID, ID = 1
+-        0,                                      // iJack
+-        // MIDI IN Jack Descriptor, B.4.3, Table B-8 (external), page 40
+-        6,                                      // bLength
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x02,                                   // bDescriptorSubtype = MIDI_IN_JACK
+-        0x02,                                   // bJackType = EXTERNAL
+-        2,                                      // bJackID, ID = 2
+-        0,                                      // iJack
+-        // MIDI OUT Jack Descriptor, B.4.4, Table B-9, page 41
+-        9,
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x03,                                   // bDescriptorSubtype = MIDI_OUT_JACK
+-        0x01,                                   // bJackType = EMBEDDED
+-        3,                                      // bJackID, ID = 3
+-        1,                                      // bNrInputPins = 1 pin
+-        2,                                      // BaSourceID(1) = 2
+-        1,                                      // BaSourcePin(1) = first pin
+-        0,                                      // iJack
+-        // MIDI OUT Jack Descriptor, B.4.4, Table B-10, page 41
+-        9,
+-        0x24,                                   // bDescriptorType = CS_INTERFACE
+-        0x03,                                   // bDescriptorSubtype = MIDI_OUT_JACK
+-        0x02,                                   // bJackType = EXTERNAL
+-        4,                                      // bJackID, ID = 4
+-        1,                                      // bNrInputPins = 1 pin
+-        1,                                      // BaSourceID(1) = 1
+-        1,                                      // BaSourcePin(1) = first pin
+-        0,                                      // iJack
+-  #if MIDI_NUM_CABLES >= 2
+-	#define MIDI_INTERFACE_JACK_PAIR(a, b, c, d) \
+-		6, 0x24, 0x02, 0x01, (a), 0, \
+-		6, 0x24, 0x02, 0x02, (b), 0, \
+-		9, 0x24, 0x03, 0x01, (c), 1, (b), 1, 0, \
+-		9, 0x24, 0x03, 0x02, (d), 1, (a), 1, 0,
+-	MIDI_INTERFACE_JACK_PAIR(5, 6, 7, 8)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 3
+-	MIDI_INTERFACE_JACK_PAIR(9, 10, 11, 12)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 4
+-	MIDI_INTERFACE_JACK_PAIR(13, 14, 15, 16)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 5
+-	MIDI_INTERFACE_JACK_PAIR(17, 18, 19, 20)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 6
+-	MIDI_INTERFACE_JACK_PAIR(21, 22, 23, 24)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 7
+-	MIDI_INTERFACE_JACK_PAIR(25, 26, 27, 28)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 8
+-	MIDI_INTERFACE_JACK_PAIR(29, 30, 31, 32)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 9
+-	MIDI_INTERFACE_JACK_PAIR(33, 34, 35, 36)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 10
+-	MIDI_INTERFACE_JACK_PAIR(37, 38, 39, 40)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 11
+-	MIDI_INTERFACE_JACK_PAIR(41, 42, 43, 44)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 12
+-	MIDI_INTERFACE_JACK_PAIR(45, 46, 47, 48)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 13
+-	MIDI_INTERFACE_JACK_PAIR(49, 50, 51, 52)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 14
+-	MIDI_INTERFACE_JACK_PAIR(53, 54, 55, 56)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 15
+-	MIDI_INTERFACE_JACK_PAIR(57, 58, 59, 60)
+-  #endif
+-  #if MIDI_NUM_CABLES >= 16
+-	MIDI_INTERFACE_JACK_PAIR(61, 62, 63, 64)
+-  #endif
+-        // Standard Bulk OUT Endpoint Descriptor, B.5.1, Table B-11, pae 42
+-        9,                                      // bLength
+-        5,                                      // bDescriptorType = ENDPOINT
+-        MIDI_RX_ENDPOINT,                       // bEndpointAddress
+-        0x02,                                   // bmAttributes (0x02=bulk)
+-        LSB(MIDI_RX_SIZE_12),MSB(MIDI_RX_SIZE_12),// wMaxPacketSize
+-        0,                                      // bInterval
+-        0,                                      // bRefresh
+-        0,                                      // bSynchAddress
+-        // Class-specific MS Bulk OUT Endpoint Descriptor, B.5.2, Table B-12, page 42
+-        4+MIDI_NUM_CABLES,                      // bLength
+-        0x25,                                   // bDescriptorSubtype = CS_ENDPOINT
+-        0x01,                                   // bJackType = MS_GENERAL
+-        MIDI_NUM_CABLES,                        // bNumEmbMIDIJack = number of jacks
+-        1,                                      // BaAssocJackID(1) = jack ID #1
+-  #if MIDI_NUM_CABLES >= 2
+-        5,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 3
+-        9,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 4
+-        13,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 5
+-        17,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 6
+-        21,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 7
+-        25,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 8
+-        29,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 9
+-        33,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 10
+-        37,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 11
+-        41,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 12
+-        45,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 13
+-        49,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 14
+-        53,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 15
+-        57,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 16
+-        61,
+-  #endif
+-        // Standard Bulk IN Endpoint Descriptor, B.5.1, Table B-11, pae 42
+-        9,                                      // bLength
+-        5,                                      // bDescriptorType = ENDPOINT
+-        MIDI_TX_ENDPOINT | 0x80,                // bEndpointAddress
+-        0x02,                                   // bmAttributes (0x02=bulk)
+-        LSB(MIDI_TX_SIZE_12),MSB(MIDI_TX_SIZE_12),// wMaxPacketSize
+-        0,                                      // bInterval
+-        0,                                      // bRefresh
+-        0,                                      // bSynchAddress
+-        // Class-specific MS Bulk IN Endpoint Descriptor, B.5.2, Table B-12, page 42
+-        4+MIDI_NUM_CABLES,                      // bLength
+-        0x25,                                   // bDescriptorSubtype = CS_ENDPOINT
+-        0x01,                                   // bJackType = MS_GENERAL
+-        MIDI_NUM_CABLES,                        // bNumEmbMIDIJack = number of jacks
+-        3,                                      // BaAssocJackID(1) = jack ID #3
+-  #if MIDI_NUM_CABLES >= 2
+-        7,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 3
+-        11,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 4
+-        15,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 5
+-        19,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 6
+-        23,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 7
+-        27,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 8
+-        31,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 9
+-        35,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 10
+-        39,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 11
+-        43,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 12
+-        47,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 13
+-        51,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 14
+-        55,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 15
+-        59,
+-  #endif
+-  #if MIDI_NUM_CABLES >= 16
+-        63,
+-  #endif
+-#endif // MIDI_INTERFACE
++        0x02,                                   // bmAttributes (0x02=bulk)
++        CDC_TX_SIZE_12, 0,                      // wMaxPacketSize
++        0,                                      // bInterval
++#endif // CDC3_DATA_INTERFACE
+ 
+ #ifdef KEYBOARD_INTERFACE
+ 	// configuration for 12 Mbit/sec speed
+@@ -2417,98 +2270,140 @@ PROGMEM const uint8_t usb_config_descriptor_12[CONFIG_DESC_SIZE] = {
+ #endif // KEYMEDIA_INTERFACE
+ 
+ #ifdef AUDIO_INTERFACE
+-	// configuration for 12 Mbit/sec speed
+-        // interface association descriptor, USB ECN, Table 9-Z
++	// UAC2: 
++      // Standard Interface Association Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.6, Table 4-3 page 46
+         8,                                      // bLength
+         11,                                     // bDescriptorType
+         AUDIO_INTERFACE,                        // bFirstInterface
+         3,                                      // bInterfaceCount
+         0x01,                                   // bFunctionClass
+-        0x01,                                   // bFunctionSubClass
+-        0x00,                                   // bFunctionProtocol
++        0x00,                                   // bFunctionSubClass, 0x00 = FUNCTION_SUBCLASS_UNDEFINED
++        0x20,                                   // bFunctionProtocol 0x20 = IP_VERSION_02_00 = AF_VERSION_02_00
+         0,                                      // iFunction
+-	// Standard AudioControl (AC) Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-1, page 36
+-	9,					// bLength
++	// UAC2: 
++      // Standard AudioControl (AC) Interface Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.1, Table 4-4 page 47
++      9,					// bLength
+ 	4,					// bDescriptorType, 4 = INTERFACE
+ 	AUDIO_INTERFACE,			// bInterfaceNumber
+ 	0,					// bAlternateSetting
+ 	0,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	1,					// bInterfaceSubclass, 1 = AUDIO_CONTROL
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol, IP_VERSION_02_00==0x20
+ 	0,					// iInterface
+-	// Class-specific AC Interface Header Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-2, page 37-38
+-	10,					// bLength
++	// UAC2: 
++      // Input Terminal Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2, Table 4-5 page 48-49
++      9,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+ 	0x01,					// bDescriptorSubtype, 1 = HEADER
+-	0x00, 0x01,				// bcdADC (version 1.0)
+-	LSB(62), MSB(62),			// wTotalLength
+-	2,					// bInCollection
+-	AUDIO_INTERFACE+1,			// baInterfaceNr(1) - Transmit to PC
+-	AUDIO_INTERFACE+2,			// baInterfaceNr(2) - Receive from PC
++	0x00, 0x02,				// bcdADC (version 2.0)
++      0xff,                         // bCategory 0xff = other
++      LSB(75+FEATURE_UNIT_DESC_SIZE_12), MSB(75+FEATURE_UNIT_DESC_SIZE_12),// wTotalLength: size of this descriptor + all input and output and feature unit descriptors + clock sources
++      0,                            // bmControls
++	// UAC2: 
++      // Clock Source Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.1, Table 4-9 page 49-50
++      8,					// bLength
++	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
++	0x0a,					// bDescriptorSubType, 2 = CLOCK_SOURCE
++	0x3a,					// bClockID
++	0x01, 				// Internal fixed clock, not synchronized to SOF
++	1 | 4,			      // bmControls: 1: clock frequency control is read only, 4 clock validity control is read only 
++	0,                            // bAssocTerminal
++      0,		                  // iClockSource
++	// UAC2: 
+ 	// Input Terminal Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-3, page 39
+-	12,					// bLength
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.4, Table 4-9 page 52-53
++      17,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+-	0x02,					// bDescriptorSubType, 2 = INPUT_TERMINAL
++	2,					// bDescriptorSubType, 2 = INPUT_TERMINAL
+ 	1,					// bTerminalID
+-	//0x01, 0x02,				// wTerminalType, 0x0201 = MICROPHONE
+-	//0x03, 0x06,				// wTerminalType, 0x0603 = Line Connector
+ 	0x02, 0x06,				// wTerminalType, 0x0602 = Digital Audio
+ 	0,					// bAssocTerminal, 0 = unidirectional
+-	2,					// bNrChannels
+-	0x03, 0x00,				// wChannelConfig, 0x0003 = Left & Right Front
+-	0,					// iChannelNames
++	0x3a,                            // bCSourceID
++      USB_AUDIO_NO_CHANNELS_12,		// bNrChannels
++      LSB(CHANNEL_CONFIG_12),             // bmChannelConfig
++      MSB(CHANNEL_CONFIG_12),             // bmChannelConfig
++      (((CHANNEL_CONFIG_12) >> 16) & 255),// bmChannelConfig
++      (((CHANNEL_CONFIG_12) >> 24) & 255),// bmChannelConfig
++	0x00,                         // iChannelNames
++      0x00, 0x00,				// bmControls     //Todo: do we need to set copy protect
+ 	0, 					// iTerminal
+-	// Output Terminal Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-4, page 40
+-	9,					// bLength
++	// UAC2: 
++      // Output Terminal Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.5, Table 4-10 page 53
++      12,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+ 	3,					// bDescriptorSubtype, 3 = OUTPUT_TERMINAL
+ 	2,					// bTerminalID
+ 	0x01, 0x01,				// wTerminalType, 0x0101 = USB_STREAMING
+ 	0,					// bAssocTerminal, 0 = unidirectional
+-	1,					// bCSourceID, connected to input terminal, ID=1
+-	0,					// iTerminal
+-	// Input Terminal Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-3, page 39
+-	12,					// bLength
++	1,				      // bSourceID, connected to feature, ID=31
++	0x3a,					// bCSourceID
++      0,0,					// bmControls
++      0,					// iTerminal
++	// UAC2: 
++      // Input Terminal Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.4, Table 4-9 page 52-53
++      17,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+ 	2,					// bDescriptorSubType, 2 = INPUT_TERMINAL
+ 	3,					// bTerminalID
+ 	0x01, 0x01,				// wTerminalType, 0x0101 = USB_STREAMING
+ 	0,					// bAssocTerminal, 0 = unidirectional
+-	2,					// bNrChannels
+-	0x03, 0x00,				// wChannelConfig, 0x0003 = Left & Right Front
+-	0,					// iChannelNames
++	0x3a,                         // bCSourceID
++      USB_AUDIO_NO_CHANNELS_12,		// bNrChannels
++      LSB(CHANNEL_CONFIG_12),             // bmChannelConfig
++      MSB(CHANNEL_CONFIG_12),             // bmChannelConfig
++      (((CHANNEL_CONFIG_12) >> 16) & 255),// bmChannelConfig
++      (((CHANNEL_CONFIG_12) >> 24) & 255),// bmChannelConfig
++	0x00,                         // iChannelNames
++      0x00, 0x00,				// bmControls
+ 	0, 					// iTerminal
+-	// Volume feature descriptor
+-	10,					// bLength
++	// UAC2: 
++      // Feature Unit Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.8, Table 4-13 page 58-59
++	FEATURE_UNIT_DESC_SIZE_12,	// bLength
+ 	0x24, 				// bDescriptorType = CS_INTERFACE
+ 	0x06, 				// bDescriptorSubType = FEATURE_UNIT
+ 	0x31, 				// bUnitID
+ 	0x03, 				// bSourceID (Input Terminal)
+-	0x01, 				// bControlSize (each channel is 1 byte, 3 channels)
+-	0x01, 				// bmaControls(0) Master: Mute
+-	0x02, 				// bmaControls(1) Left: Volume
+-	0x02, 				// bmaControls(2) Right: Volume
+-	0x00,				// iFeature
+-	// Output Terminal Descriptor
+-	// USB DCD for Audio Devices 1.0, Table 4-4, page 40
+-	9,					// bLength
++      15,0x00,0x00,0x00,		// bmaControls(0) Master: Mute   bit 0 and 1 + bit 2 + 3 (reading and writing master volume)
++	12,0x00,0x00,0x00,		// bmaControls(1) Left: Volume   bit 2 and 3   
++	12,0x00,0x00,0x00,		// bmaControls(2) Right: Volume  bit 2 and 3
++      #if USB_AUDIO_NO_CHANNELS_12 > 2
++            12,0x00,0x00,0x00,		// bmaControls(1) channel 3: Volume   bit 2 and 3   
++            12,0x00,0x00,0x00,		// bmaControls(2) channel 4: Volume  bit 2 and 3
++      #endif
++      #if USB_AUDIO_NO_CHANNELS_12 > 4
++            12,0x00,0x00,0x00,		// bmaControls(1) channel 5: Volume   bit 2 and 3   
++            12,0x00,0x00,0x00,		// bmaControls(2) channel 6: Volume  bit 2 and 3
++      #endif
++      #if USB_AUDIO_NO_CHANNELS_12 > 6
++            12,0x00,0x00,0x00,		// bmaControls(1) channel 7: Volume   bit 2 and 3   
++            12,0x00,0x00,0x00,		// bmaControls(2) channel 8: Volume  bit 2 and 3
++      #endif
++      0x00,				      // iFeature
++	// UAC2: 
++      // Output Terminal Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.7.2.5, Table 4-10 page 53
++      12,					// bLength
+ 	0x24,					// bDescriptorType, 0x24 = CS_INTERFACE
+ 	3,					// bDescriptorSubtype, 3 = OUTPUT_TERMINAL
+ 	4,					// bTerminalID
+-	//0x02, 0x03,				// wTerminalType, 0x0302 = Headphones
+ 	0x02, 0x06,				// wTerminalType, 0x0602 = Digital Audio
+ 	0,					// bAssocTerminal, 0 = unidirectional
+-	0x31,				// bCSourceID, connected to feature, ID=31
+-	0,					// iTerminal
+-	// Standard AS Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.5.1, Table 4-18, page 59
+-	// Alternate 0: default setting, disabled zero bandwidth
++	0x31,				      // bSourceID, connected to feature, ID=31
++	0x3a,					// bCSourceID
++      0,0,					// bmControls
++      0,					// iTerminal
++	// UAC2: 
++      // Standard AS Interface Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.9.1, Table 4-26 page 75
++      // Alternate 0: default setting, disabled zero bandwidth
+ 	9,					// bLenght
+ 	4,					// bDescriptorType = INTERFACE
+ 	AUDIO_INTERFACE+1,			// bInterfaceNumber
+@@ -2516,7 +2411,7 @@ PROGMEM const uint8_t usb_config_descriptor_12[CONFIG_DESC_SIZE] = {
+ 	0,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	2,					// bInterfaceSubclass, 2 = AUDIO_STREAMING
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol IP_VERSION_02_00==0x20
+ 	0,					// iInterface
+ 	// Alternate 1: streaming data
+ 	9,					// bLenght
+@@ -2526,48 +2421,59 @@ PROGMEM const uint8_t usb_config_descriptor_12[CONFIG_DESC_SIZE] = {
+ 	1,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	2,					// bInterfaceSubclass, 2 = AUDIO_STREAMING
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol IP_VERSION_02_00==0x20
+ 	0,					// iInterface
++	// UAC2: 
+ 	// Class-Specific AS Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.5.2, Table 4-19, page 60
+-	7, 					// bLength
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.9.2, Table 4-27 page 75-77
++      16, 					// bLength
+ 	0x24,					// bDescriptorType = CS_INTERFACE
+ 	1,					// bDescriptorSubtype, 1 = AS_GENERAL
+ 	2,					// bTerminalLink: Terminal ID = 2
+-	3,					// bDelay (approx 3ms delay, audio lib updates)
+-	0x01, 0x00,				// wFormatTag, 0x0001 = PCM
+-	// Type I Format Descriptor
+-	// USB DCD for Audio Data Formats 1.0, Section 2.2.5, Table 2-1, page 10
+-	11,					// bLength
++	0,                            //bmControls
++      1,                            //bFormatType 1=FORMAT_TYPE_I
++      0x01, 0x00, 0x00, 0x00,       //bmFormats first bit: PCM
++ 	USB_AUDIO_NO_CHANNELS_12,           // bNrChannels
++      LSB(CHANNEL_CONFIG_12),             // bmChannelConfig
++      MSB(CHANNEL_CONFIG_12),             // bmChannelConfig
++      (((CHANNEL_CONFIG_12) >> 16) & 255),// bmChannelConfig
++      (((CHANNEL_CONFIG_12) >> 24) & 255),// bmChannelConfig
++      0,                                  // iChannelNames   index of string descriptor at the bottom of the file
++	// UAC2: 
++      // Univeral Serial Bus Device Class Definition for Audio Data Formats 2.0, Section 2.3.1.6, Table 2-2, page 15-16
++      6,					// bLength
+ 	0x24,					// bDescriptorType = CS_INTERFACE
+ 	2,					// bDescriptorSubtype = FORMAT_TYPE
+ 	1,					// bFormatType = FORMAT_TYPE_I
+-	2,					// bNrChannels = 2
+-	2,					// bSubFrameSize = 2 byte
+-	16,					// bBitResolution = 16 bits
+-	1,					// bSamFreqType = 1 frequency
+-	LSB(44100), MSB(44100), 0,		// tSamFreq
++	AUDIO_SUBSLOT_SIZE,		// bSubSlotSize = size of a single sample in bytes (e.g. 2 bytes for 16bit audio)
++	AUDIO_BITRESOLUTION,		// bBitResolution = 16 bits
++	// UAC2: 
+ 	// Standard AS Isochronous Audio Data Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.1.1, Table 4-20, page 61-62
+-	9, 					// bLength
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.1.1, Table 4-33 page 85-86
++	7, 					// bLength
+ 	5, 					// bDescriptorType, 5 = ENDPOINT_DESCRIPTOR
+-	AUDIO_TX_ENDPOINT | 0x80,		// bEndpointAddress
+-	0x09, 					// bmAttributes = isochronous, adaptive
+-	LSB(AUDIO_TX_SIZE), MSB(AUDIO_TX_SIZE),	// wMaxPacketSize
+-	1,			 		// bInterval, 1 = every frame
+-	0,					// bRefresh
+-	0,					// bSynchAddress
+-	// Class-Specific AS Isochronous Audio Data Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.1.2, Table 4-21, page 62-63
+-	7,  					// bLength
+-	0x25,  					// bDescriptorType, 0x25 = CS_ENDPOINT
++	AUDIO_TX_ENDPOINT | 0x80,	// bEndpointAddress (0x80 = 10000000 -> audio source)
++#ifdef ASYNC_TX_ENDPOINT
++	0x05, 				// bmAttributes, 0x09 = isochronous, adaptive, 0x05 = isochronous, asynchronous
++#elif
++      0x09,                         // bmAttributes, 0x09 = isochronous, adaptive, 0x05 = isochronous, asynchronous
++#endif 
++	LSB(AUDIO_TX_SIZE_12), MSB(AUDIO_TX_SIZE_12),	// wMaxPacketSize
++	AUDIO_POLLING_INTERVAL_12,			 	// bInterval, 4 -> 2^(4-1)=8 -> every 8 micro-frames
++	// UAC2: 
++      // Class-Specific AS Isochronous Audio Data Endpoint Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.1.2, Table 4-34 page 86-87
++      8,  					// bLength
++	0x25,  				// bDescriptorType, 0x25 = CS_ENDPOINT
+ 	1,  					// bDescriptorSubtype, 1 = EP_GENERAL
+-	0x00,  					// bmAttributes
++	0x00,  				// bmAttributes
++	0x00,  				// bmControls
+ 	0,  					// bLockDelayUnits, 1 = ms
+-	0x00, 0x00,  				// wLockDelay
+-	// Standard AS Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.5.1, Table 4-18, page 59
+-	// Alternate 0: default setting, disabled zero bandwidth
++	0x00, 0x00,  			// wLockDelay
++	// UAC2: 
++      // Standard AS Interface Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.9.1, Table 4-26 page 75
++      // Alternate 0: default setting, disabled zero bandwidth
+ 	9,					// bLenght
+ 	4,					// bDescriptorType = INTERFACE
+ 	AUDIO_INTERFACE+2,			// bInterfaceNumber
+@@ -2575,7 +2481,7 @@ PROGMEM const uint8_t usb_config_descriptor_12[CONFIG_DESC_SIZE] = {
+ 	0,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	2,					// bInterfaceSubclass, 2 = AUDIO_STREAMING
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol IP_VERSION_02_00==0x20
+ 	0,					// iInterface
+ 	// Alternate 1: streaming data
+ 	9,					// bLenght
+@@ -2585,57 +2491,286 @@ PROGMEM const uint8_t usb_config_descriptor_12[CONFIG_DESC_SIZE] = {
+ 	2,					// bNumEndpoints
+ 	1,					// bInterfaceClass, 1 = AUDIO
+ 	2,					// bInterfaceSubclass, 2 = AUDIO_STREAMING
+-	0,					// bInterfaceProtocol
++	0x20,					// bInterfaceProtocol IP_VERSION_02_00==0x20
+ 	0,					// iInterface
+-	// Class-Specific AS Interface Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.5.2, Table 4-19, page 60
+-	7, 					// bLength
++	// UAC2: 
++      // Class-Specific AS Interface Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.9.2, Table 4-27 page 75-77
++      16, 					// bLength
+ 	0x24,					// bDescriptorType = CS_INTERFACE
+ 	1,					// bDescriptorSubtype, 1 = AS_GENERAL
+ 	3,					// bTerminalLink: Terminal ID = 3
+-	3,					// bDelay (approx 3ms delay, audio lib updates)
+-	0x01, 0x00,				// wFormatTag, 0x0001 = PCM
+-	// Type I Format Descriptor
+-	// USB DCD for Audio Data Formats 1.0, Section 2.2.5, Table 2-1, page 10
+-	11,					// bLength
++	0,                            //bmControls
++      1,                            //bFormatType 1=FORMAT_TYPE_I
++      0x01, 0x00, 0x00, 0x00,       //bmFormats first bit: PCM
++ 	USB_AUDIO_NO_CHANNELS_12,           // bNrChannels
++      LSB(CHANNEL_CONFIG_12),             // bmChannelConfig
++      MSB(CHANNEL_CONFIG_12),             // bmChannelConfig
++      (((CHANNEL_CONFIG_12) >> 16) & 255),// bmChannelConfig
++      (((CHANNEL_CONFIG_12) >> 24) & 255),// bmChannelConfig
++      0,                                  //iChannelNames   index of string descriptor at the bottom of the file
++	// UAC2: 
++      // Univeral Serial Bus Device Class Definition for Audio Data Formats 2.0, Section 2.3.1.6, Table 2-2, page 15-16
++      6,					// bLength
+ 	0x24,					// bDescriptorType = CS_INTERFACE
+ 	2,					// bDescriptorSubtype = FORMAT_TYPE
+ 	1,					// bFormatType = FORMAT_TYPE_I
+-	2,					// bNrChannels = 2
+-	2,					// bSubFrameSize = 2 byte
+-	16,					// bBitResolution = 16 bits
+-	1,					// bSamFreqType = 1 frequency
+-	LSB(44100), MSB(44100), 0,		// tSamFreq
++	AUDIO_SUBSLOT_SIZE,		// bSubSlotSize = size of a single sample in bytes (e.g. 2 bytes for 16bit audio)
++	AUDIO_BITRESOLUTION,		// bBitResolution = 16 bits
++	// UAC2: 
+ 	// Standard AS Isochronous Audio Data Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.1.1, Table 4-20, page 61-62
+-	9, 					// bLength
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.1.1, Table 4-33 page 85-86
++	7, 					// bLength
+ 	5, 					// bDescriptorType, 5 = ENDPOINT_DESCRIPTOR
+-	AUDIO_RX_ENDPOINT,			// bEndpointAddress
+-	0x05, 					// bmAttributes = isochronous, asynchronous
+-	LSB(AUDIO_RX_SIZE), MSB(AUDIO_RX_SIZE),	// wMaxPacketSize
+-	1,			 		// bInterval, 1 = every frame
+-	0,					// bRefresh
+-	AUDIO_SYNC_ENDPOINT | 0x80,		// bSynchAddress
+-	// Class-Specific AS Isochronous Audio Data Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.1.2, Table 4-21, page 62-63
+-	7,  					// bLength
+-	0x25,  					// bDescriptorType, 0x25 = CS_ENDPOINT
++	AUDIO_RX_ENDPOINT | 0x00,	// bEndpointAddress  (0x00 = 00000000 -> audio sink)
++	0x05, 				// bmAttributes = isochronous, asynchronous
++	LSB(AUDIO_RX_SIZE_12), MSB(AUDIO_RX_SIZE_12),	// wMaxPacketSize
++	AUDIO_POLLING_INTERVAL_12,			 	// bInterval, 4 -> 2^(4-1)=8 -> every 8 micro-frames
++	// UAC2: 
++      // Class-Specific AS Isochronous Audio Data Endpoint Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.1.2, Table 4-34 page 86-87
++      8,  					// bLength
++	0x25,  				// bDescriptorType, 0x25 = CS_ENDPOINT
+ 	1,  					// bDescriptorSubtype, 1 = EP_GENERAL
+-	0x00,  					// bmAttributes
++	0x00,  				// bmAttributes
++	0x00,  				// bmControls
+ 	0,  					// bLockDelayUnits, 1 = ms
+-	0x00, 0x00,  				// wLockDelay
+-	// Standard AS Isochronous Audio Synch Endpoint Descriptor
+-	// USB DCD for Audio Devices 1.0, Section 4.6.2.1, Table 4-22, page 63-64
+-	9, 					// bLength
++	0x00, 0x00,  			// wLockDelay
++	// UAC2: 
++      // Standard AS Isochronous Feedback Endpoint Descriptor
++      // Universal Serial Bus Device Class Definition for Audio Devices 2.0, Section 4.10.2.1, Table 4-35 page 87-88
++      7, 					// bLength
+ 	5, 					// bDescriptorType, 5 = ENDPOINT_DESCRIPTOR
+-	AUDIO_SYNC_ENDPOINT | 0x80,		// bEndpointAddress
+-	0x11, 					// bmAttributes = isochronous, feedback
+-	3, 0,					// wMaxPacketSize, 3 bytes
+-	1,			 		// bInterval, 1 = every frame
+-	5,					// bRefresh, 5 = 32ms
+-	0,					// bSynchAddress
++	AUDIO_SYNC_ENDPOINT | 0x80,	// bEndpointAddress, 0x80=10000000 -> IN endpoint
++	0x11, 				// bmAttributes = isochronous, feedback
++	4, 0,					// wMaxPacketSize, 4 bytes
++	AUDIO_POLLING_INTERVAL_12,	// bInterval, 4 -> 2^(4-1) = 8 -> every 8 micro-frames
+ #endif
+ 
++#ifdef MIDI_INTERFACE
++	// configuration for 12 Mbit/sec speed
++        // Standard MS Interface Descriptor,
++        9,                                      // bLength
++        4,                                      // bDescriptorType
++        MIDI_INTERFACE,                         // bInterfaceNumber
++        0,                                      // bAlternateSetting
++        2,                                      // bNumEndpoints
++        0x01,                                   // bInterfaceClass (0x01 = Audio)
++        0x03,                                   // bInterfaceSubClass (0x03 = MIDI)
++        0x00,                                   // bInterfaceProtocol (unused for MIDI)
++        0,                                      // iInterface
++        // MIDI MS Interface Header, USB MIDI 6.1.2.1, page 21, Table 6-2
++        7,                                      // bLength
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x01,                                   // bDescriptorSubtype = MS_HEADER
++        0x00, 0x01,                             // bcdMSC = revision 01.00
++	LSB(7+(6+6+9+9)*MIDI_NUM_CABLES),       // wTotalLength
++	MSB(7+(6+6+9+9)*MIDI_NUM_CABLES),
++        // MIDI IN Jack Descriptor, B.4.3, Table B-7 (embedded), page 40
++        6,                                      // bLength
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x02,                                   // bDescriptorSubtype = MIDI_IN_JACK
++        0x01,                                   // bJackType = EMBEDDED
++        1,                                      // bJackID, ID = 1
++        0,                                      // iJack
++        // MIDI IN Jack Descriptor, B.4.3, Table B-8 (external), page 40
++        6,                                      // bLength
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x02,                                   // bDescriptorSubtype = MIDI_IN_JACK
++        0x02,                                   // bJackType = EXTERNAL
++        2,                                      // bJackID, ID = 2
++        0,                                      // iJack
++        // MIDI OUT Jack Descriptor, B.4.4, Table B-9, page 41
++        9,
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x03,                                   // bDescriptorSubtype = MIDI_OUT_JACK
++        0x01,                                   // bJackType = EMBEDDED
++        3,                                      // bJackID, ID = 3
++        1,                                      // bNrInputPins = 1 pin
++        2,                                      // BaSourceID(1) = 2
++        1,                                      // BaSourcePin(1) = first pin
++        0,                                      // iJack
++        // MIDI OUT Jack Descriptor, B.4.4, Table B-10, page 41
++        9,
++        0x24,                                   // bDescriptorType = CS_INTERFACE
++        0x03,                                   // bDescriptorSubtype = MIDI_OUT_JACK
++        0x02,                                   // bJackType = EXTERNAL
++        4,                                      // bJackID, ID = 4
++        1,                                      // bNrInputPins = 1 pin
++        1,                                      // BaSourceID(1) = 1
++        1,                                      // BaSourcePin(1) = first pin
++        0,                                      // iJack
++  #if MIDI_NUM_CABLES >= 2
++	#define MIDI_INTERFACE_JACK_PAIR(a, b, c, d) \
++		6, 0x24, 0x02, 0x01, (a), 0, \
++		6, 0x24, 0x02, 0x02, (b), 0, \
++		9, 0x24, 0x03, 0x01, (c), 1, (b), 1, 0, \
++		9, 0x24, 0x03, 0x02, (d), 1, (a), 1, 0,
++	MIDI_INTERFACE_JACK_PAIR(5, 6, 7, 8)
++  #endif
++  #if MIDI_NUM_CABLES >= 3
++	MIDI_INTERFACE_JACK_PAIR(9, 10, 11, 12)
++  #endif
++  #if MIDI_NUM_CABLES >= 4
++	MIDI_INTERFACE_JACK_PAIR(13, 14, 15, 16)
++  #endif
++  #if MIDI_NUM_CABLES >= 5
++	MIDI_INTERFACE_JACK_PAIR(17, 18, 19, 20)
++  #endif
++  #if MIDI_NUM_CABLES >= 6
++	MIDI_INTERFACE_JACK_PAIR(21, 22, 23, 24)
++  #endif
++  #if MIDI_NUM_CABLES >= 7
++	MIDI_INTERFACE_JACK_PAIR(25, 26, 27, 28)
++  #endif
++  #if MIDI_NUM_CABLES >= 8
++	MIDI_INTERFACE_JACK_PAIR(29, 30, 31, 32)
++  #endif
++  #if MIDI_NUM_CABLES >= 9
++	MIDI_INTERFACE_JACK_PAIR(33, 34, 35, 36)
++  #endif
++  #if MIDI_NUM_CABLES >= 10
++	MIDI_INTERFACE_JACK_PAIR(37, 38, 39, 40)
++  #endif
++  #if MIDI_NUM_CABLES >= 11
++	MIDI_INTERFACE_JACK_PAIR(41, 42, 43, 44)
++  #endif
++  #if MIDI_NUM_CABLES >= 12
++	MIDI_INTERFACE_JACK_PAIR(45, 46, 47, 48)
++  #endif
++  #if MIDI_NUM_CABLES >= 13
++	MIDI_INTERFACE_JACK_PAIR(49, 50, 51, 52)
++  #endif
++  #if MIDI_NUM_CABLES >= 14
++	MIDI_INTERFACE_JACK_PAIR(53, 54, 55, 56)
++  #endif
++  #if MIDI_NUM_CABLES >= 15
++	MIDI_INTERFACE_JACK_PAIR(57, 58, 59, 60)
++  #endif
++  #if MIDI_NUM_CABLES >= 16
++	MIDI_INTERFACE_JACK_PAIR(61, 62, 63, 64)
++  #endif
++        // Standard Bulk OUT Endpoint Descriptor, B.5.1, Table B-11, pae 42
++        9,                                      // bLength
++        5,                                      // bDescriptorType = ENDPOINT
++        MIDI_RX_ENDPOINT,                       // bEndpointAddress
++        0x02,                                   // bmAttributes (0x02=bulk)
++        LSB(MIDI_RX_SIZE_12),MSB(MIDI_RX_SIZE_12),// wMaxPacketSize
++        0,                                      // bInterval
++        0,                                      // bRefresh
++        0,                                      // bSynchAddress
++        // Class-specific MS Bulk OUT Endpoint Descriptor, B.5.2, Table B-12, page 42
++        4+MIDI_NUM_CABLES,                      // bLength
++        0x25,                                   // bDescriptorSubtype = CS_ENDPOINT
++        0x01,                                   // bJackType = MS_GENERAL
++        MIDI_NUM_CABLES,                        // bNumEmbMIDIJack = number of jacks
++        1,                                      // BaAssocJackID(1) = jack ID #1
++  #if MIDI_NUM_CABLES >= 2
++        5,
++  #endif
++  #if MIDI_NUM_CABLES >= 3
++        9,
++  #endif
++  #if MIDI_NUM_CABLES >= 4
++        13,
++  #endif
++  #if MIDI_NUM_CABLES >= 5
++        17,
++  #endif
++  #if MIDI_NUM_CABLES >= 6
++        21,
++  #endif
++  #if MIDI_NUM_CABLES >= 7
++        25,
++  #endif
++  #if MIDI_NUM_CABLES >= 8
++        29,
++  #endif
++  #if MIDI_NUM_CABLES >= 9
++        33,
++  #endif
++  #if MIDI_NUM_CABLES >= 10
++        37,
++  #endif
++  #if MIDI_NUM_CABLES >= 11
++        41,
++  #endif
++  #if MIDI_NUM_CABLES >= 12
++        45,
++  #endif
++  #if MIDI_NUM_CABLES >= 13
++        49,
++  #endif
++  #if MIDI_NUM_CABLES >= 14
++        53,
++  #endif
++  #if MIDI_NUM_CABLES >= 15
++        57,
++  #endif
++  #if MIDI_NUM_CABLES >= 16
++        61,
++  #endif
++        // Standard Bulk IN Endpoint Descriptor, B.5.1, Table B-11, pae 42
++        9,                                      // bLength
++        5,                                      // bDescriptorType = ENDPOINT
++        MIDI_TX_ENDPOINT | 0x80,                // bEndpointAddress
++        0x02,                                   // bmAttributes (0x02=bulk)
++        LSB(MIDI_TX_SIZE_12),MSB(MIDI_TX_SIZE_12),// wMaxPacketSize
++        0,                                      // bInterval
++        0,                                      // bRefresh
++        0,                                      // bSynchAddress
++        // Class-specific MS Bulk IN Endpoint Descriptor, B.5.2, Table B-12, page 42
++        4+MIDI_NUM_CABLES,                      // bLength
++        0x25,                                   // bDescriptorSubtype = CS_ENDPOINT
++        0x01,                                   // bJackType = MS_GENERAL
++        MIDI_NUM_CABLES,                        // bNumEmbMIDIJack = number of jacks
++        3,                                      // BaAssocJackID(1) = jack ID #3
++  #if MIDI_NUM_CABLES >= 2
++        7,
++  #endif
++  #if MIDI_NUM_CABLES >= 3
++        11,
++  #endif
++  #if MIDI_NUM_CABLES >= 4
++        15,
++  #endif
++  #if MIDI_NUM_CABLES >= 5
++        19,
++  #endif
++  #if MIDI_NUM_CABLES >= 6
++        23,
++  #endif
++  #if MIDI_NUM_CABLES >= 7
++        27,
++  #endif
++  #if MIDI_NUM_CABLES >= 8
++        31,
++  #endif
++  #if MIDI_NUM_CABLES >= 9
++        35,
++  #endif
++  #if MIDI_NUM_CABLES >= 10
++        39,
++  #endif
++  #if MIDI_NUM_CABLES >= 11
++        43,
++  #endif
++  #if MIDI_NUM_CABLES >= 12
++        47,
++  #endif
++  #if MIDI_NUM_CABLES >= 13
++        51,
++  #endif
++  #if MIDI_NUM_CABLES >= 14
++        55,
++  #endif
++  #if MIDI_NUM_CABLES >= 15
++        59,
++  #endif
++  #if MIDI_NUM_CABLES >= 16
++        63,
++  #endif
++#endif // MIDI_INTERFACE
+ #ifdef MULTITOUCH_INTERFACE
+ 	// configuration for 12 Mbit/sec speed
+         // interface descriptor, USB spec 9.6.5, page 267-269, Table 9-12
+@@ -2695,12 +2830,13 @@ PROGMEM const uint8_t usb_config_descriptor_12[CONFIG_DESC_SIZE] = {
+ #endif // EXPERIMENTAL_INTERFACE
+ };
+ 
+-
+-__attribute__ ((section(".dmabuffers"), aligned(32)))
+-uint8_t usb_descriptor_buffer[CONFIG_DESC_SIZE];
+-
+-
+-
++#if CONFIG_DESC_SIZE_480 > CONFIG_DESC_SIZE_12
++      __attribute__ ((section(".dmabuffers"), aligned(32)))
++      uint8_t usb_descriptor_buffer[CONFIG_DESC_SIZE_480];
++#else
++      __attribute__ ((section(".dmabuffers"), aligned(32)))
++      uint8_t usb_descriptor_buffer[CONFIG_DESC_SIZE_12];
++#endif
+ 
+ 
+ // **************************************************************
+@@ -2742,6 +2878,7 @@ PROGMEM const struct usb_string_descriptor_struct usb_string_product_name_defaul
+         3,
+         PRODUCT_NAME
+ };
++
+ struct usb_string_descriptor_struct usb_string_serial_number_default = {
+         12,
+         3,
+@@ -2783,8 +2920,8 @@ const usb_descriptor_list_t usb_descriptor_list[] = {
+ 	//wValue, wIndex, address,          length
+ 	{0x0100, 0x0000, device_descriptor, sizeof(device_descriptor)},
+ 	{0x0600, 0x0000, qualifier_descriptor, sizeof(qualifier_descriptor)},
+-	{0x0200, 0x0000, usb_config_descriptor_480, CONFIG_DESC_SIZE},
+-	{0x0700, 0x0000, usb_config_descriptor_12, CONFIG_DESC_SIZE},
++	{0x0200, 0x0000, usb_config_descriptor_480, CONFIG_DESC_SIZE_480},
++	{0x0700, 0x0000, usb_config_descriptor_12, CONFIG_DESC_SIZE_12},
+ #ifdef SEREMU_INTERFACE
+ 	{0x2200, SEREMU_INTERFACE, seremu_report_desc, sizeof(seremu_report_desc)},
+ 	{0x2100, SEREMU_INTERFACE, usb_config_descriptor_480+SEREMU_HID_DESC_OFFSET, 9},
+diff --git a/cores/teensy4/usb_desc.h b/cores/teensy4/usb_desc.h
+index b4e6de7..a8e2d75 100644
+--- a/cores/teensy4/usb_desc.h
++++ b/cores/teensy4/usb_desc.h
+@@ -35,6 +35,10 @@
+ // provided by usb_dev.c are meant to be called only by
+ // code which provides higher-level interfaces to the user.
+ 
++#define IN_USB_DESC_H // signal we only need sample rate macros
++#include <AudioStream.h>
++#undef IN_USB_DESC_H
++
+ #include <stdint.h>
+ #include <stddef.h>
+ 
+@@ -750,6 +754,7 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
+   #define MANUFACTURER_NAME_LEN	11
+   #define PRODUCT_NAME		{'T','e','e','n','s','y',' ','A','u','d','i','o'}
+   #define PRODUCT_NAME_LEN	12
++
+   #define EP0_SIZE		64
+   #define NUM_ENDPOINTS         4
+   #define NUM_INTERFACE		4
+@@ -760,12 +765,12 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
+   #define SEREMU_RX_ENDPOINT    2
+   #define SEREMU_RX_SIZE        32
+   #define SEREMU_RX_INTERVAL    2
++  
+   #define AUDIO_INTERFACE	1	// Audio (uses 3 consecutive interfaces)
+   #define AUDIO_TX_ENDPOINT     3
+-  #define AUDIO_TX_SIZE         180
+   #define AUDIO_RX_ENDPOINT     3
+-  #define AUDIO_RX_SIZE         180
+   #define AUDIO_SYNC_ENDPOINT	4
++
+   #define ENDPOINT2_CONFIG	ENDPOINT_RECEIVE_INTERRUPT + ENDPOINT_TRANSMIT_INTERRUPT
+   #define ENDPOINT3_CONFIG	ENDPOINT_RECEIVE_ISOCHRONOUS + ENDPOINT_TRANSMIT_ISOCHRONOUS
+   #define ENDPOINT4_CONFIG	ENDPOINT_RECEIVE_UNUSED + ENDPOINT_TRANSMIT_ISOCHRONOUS
+@@ -791,7 +796,11 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
+   #define CDC_TX_SIZE_480       512
+   #define CDC_RX_SIZE_12        64
+   #define CDC_TX_SIZE_12        64
+-  #define MIDI_INTERFACE        2	// MIDI
++  #define AUDIO_INTERFACE	      2	// Audio (uses 3 consecutive interfaces)
++  #define AUDIO_TX_ENDPOINT     5
++  #define AUDIO_RX_ENDPOINT     5
++  #define AUDIO_SYNC_ENDPOINT   6
++  #define MIDI_INTERFACE        5	// MIDI (usb2 specification: interface number of midi must directly follow the audio interface numbers)
+   #define MIDI_NUM_CABLES       1
+   #define MIDI_TX_ENDPOINT      4
+   #define MIDI_TX_SIZE_12       64
+@@ -799,12 +808,6 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
+   #define MIDI_RX_ENDPOINT      4
+   #define MIDI_RX_SIZE_12       64
+   #define MIDI_RX_SIZE_480      512
+-  #define AUDIO_INTERFACE	3	// Audio (uses 3 consecutive interfaces)
+-  #define AUDIO_TX_ENDPOINT     5
+-  #define AUDIO_TX_SIZE         180
+-  #define AUDIO_RX_ENDPOINT     5
+-  #define AUDIO_RX_SIZE         180
+-  #define AUDIO_SYNC_ENDPOINT	6
+   #define ENDPOINT2_CONFIG	ENDPOINT_RECEIVE_UNUSED + ENDPOINT_TRANSMIT_INTERRUPT
+   #define ENDPOINT3_CONFIG	ENDPOINT_RECEIVE_BULK + ENDPOINT_TRANSMIT_BULK
+   #define ENDPOINT4_CONFIG	ENDPOINT_RECEIVE_BULK + ENDPOINT_TRANSMIT_BULK
+@@ -824,7 +827,7 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
+   #define NUM_INTERFACE		6
+   #define CDC_IAD_DESCRIPTOR	1
+   #define CDC_STATUS_INTERFACE	0
+-  #define CDC_DATA_INTERFACE	1	// Serial
++  #define CDC_DATA_INTERFACE	  1	// Serial
+   #define CDC_ACM_ENDPOINT	2
+   #define CDC_RX_ENDPOINT       3
+   #define CDC_TX_ENDPOINT       3
+@@ -833,7 +836,11 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
+   #define CDC_TX_SIZE_480       512
+   #define CDC_RX_SIZE_12        64
+   #define CDC_TX_SIZE_12        64
+-  #define MIDI_INTERFACE        2	// MIDI
++  #define AUDIO_INTERFACE	      2	// Audio (uses 3 consecutive interfaces)
++  #define AUDIO_TX_ENDPOINT     5
++  #define AUDIO_RX_ENDPOINT     5
++  #define AUDIO_SYNC_ENDPOINT	  6
++  #define MIDI_INTERFACE        5	// MIDI (usb2 specification: interface number of midi must directly follow the audio interface numbers)
+   #define MIDI_NUM_CABLES       16
+   #define MIDI_TX_ENDPOINT      4
+   #define MIDI_TX_SIZE_12       64
+@@ -841,12 +848,6 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
+   #define MIDI_RX_ENDPOINT      4
+   #define MIDI_RX_SIZE_12       64
+   #define MIDI_RX_SIZE_480      512
+-  #define AUDIO_INTERFACE	3	// Audio (uses 3 consecutive interfaces)
+-  #define AUDIO_TX_ENDPOINT     5
+-  #define AUDIO_TX_SIZE         180
+-  #define AUDIO_RX_ENDPOINT     5
+-  #define AUDIO_RX_SIZE         180
+-  #define AUDIO_SYNC_ENDPOINT	6
+   #define ENDPOINT2_CONFIG	ENDPOINT_RECEIVE_UNUSED + ENDPOINT_TRANSMIT_INTERRUPT
+   #define ENDPOINT3_CONFIG	ENDPOINT_RECEIVE_BULK + ENDPOINT_TRANSMIT_BULK
+   #define ENDPOINT4_CONFIG	ENDPOINT_RECEIVE_BULK + ENDPOINT_TRANSMIT_BULK
+@@ -877,35 +878,29 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
+   #define CDC_ACM_SIZE          16
+   #define CDC_RX_SIZE           64
+   #define CDC_TX_SIZE           64
+-  #define MIDI_INTERFACE        2	// MIDI
+-  #define MIDI_NUM_CABLES       16
+-  #define MIDI_TX_ENDPOINT      3
+-  #define MIDI_TX_SIZE          64
+-  #define MIDI_RX_ENDPOINT      3
+-  #define MIDI_RX_SIZE          64
+-  #define KEYBOARD_INTERFACE    3	// Keyboard
++  #define KEYBOARD_INTERFACE    2	// Keyboard
+   #define KEYBOARD_ENDPOINT     4
+   #define KEYBOARD_SIZE         8
+   #define KEYBOARD_INTERVAL     1
+-  #define MOUSE_INTERFACE       4	// Mouse
++  #define MOUSE_INTERFACE       3	// Mouse
+   #define MOUSE_ENDPOINT        5
+   #define MOUSE_SIZE            8
+   #define MOUSE_INTERVAL        2
+-  #define RAWHID_INTERFACE      5	// RawHID
++  #define RAWHID_INTERFACE      4	// RawHID
+   #define RAWHID_TX_ENDPOINT    6
+   #define RAWHID_TX_SIZE        64
+   #define RAWHID_TX_INTERVAL    1
+   #define RAWHID_RX_ENDPOINT    6
+   #define RAWHID_RX_SIZE        64
+   #define RAWHID_RX_INTERVAL    1
+-  #define FLIGHTSIM_INTERFACE	6	// Flight Sim Control
++  #define FLIGHTSIM_INTERFACE	  5	// Flight Sim Control
+   #define FLIGHTSIM_TX_ENDPOINT	9
+   #define FLIGHTSIM_TX_SIZE	64
+   #define FLIGHTSIM_TX_INTERVAL	1
+   #define FLIGHTSIM_RX_ENDPOINT	9
+   #define FLIGHTSIM_RX_SIZE	64
+   #define FLIGHTSIM_RX_INTERVAL	1
+-  #define JOYSTICK_INTERFACE    7	// Joystick
++  #define JOYSTICK_INTERFACE    6	// Joystick
+   #define JOYSTICK_ENDPOINT     10
+   #define JOYSTICK_SIZE         12	//  12 = normal, 64 = extreme joystick
+   #define JOYSTICK_INTERVAL     1
+@@ -919,16 +914,20 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
+   #define MTP_EVENT_SIZE	16
+   #define MTP_EVENT_INTERVAL	10
+ */
+-  #define KEYMEDIA_INTERFACE    8	// Keyboard Media Keys
++  #define KEYMEDIA_INTERFACE    7	// Keyboard Media Keys
+   #define KEYMEDIA_ENDPOINT     12
+   #define KEYMEDIA_SIZE         8
+   #define KEYMEDIA_INTERVAL     4
+-  #define AUDIO_INTERFACE	9	// Audio (uses 3 consecutive interfaces)
++  #define AUDIO_INTERFACE	      8	// Audio (uses 3 consecutive interfaces)
+   #define AUDIO_TX_ENDPOINT     13
+-  #define AUDIO_TX_SIZE         180
+   #define AUDIO_RX_ENDPOINT     13
+-  #define AUDIO_RX_SIZE         180
+   #define AUDIO_SYNC_ENDPOINT	14
++  #define MIDI_INTERFACE        11	// MIDI (usb2 specification: interface number of midi must directly follow the audio interface numbers)
++  #define MIDI_NUM_CABLES       16
++  #define MIDI_TX_ENDPOINT      3
++  #define MIDI_TX_SIZE          64
++  #define MIDI_RX_ENDPOINT      3
++  #define MIDI_RX_SIZE          64
+   #define MULTITOUCH_INTERFACE  12	// Touchscreen
+   #define MULTITOUCH_ENDPOINT   15
+   #define MULTITOUCH_SIZE       9
+@@ -967,3 +966,149 @@ extern const usb_descriptor_list_t usb_descriptor_list[];
+ #endif // NUM_ENDPOINTS
+ #endif // USB_DESC_LIST_DEFINE
+ 
++#ifdef AUDIO_INTERFACE
++  #ifndef AUDIO_SUBSLOT_SIZE
++  #define AUDIO_SUBSLOT_SIZE 2 //size of an audio sample in bytes (possible values: 1,2,3 or 4)
++  #endif
++  #define AUDIO_BITRESOLUTION (8*AUDIO_SUBSLOT_SIZE)
++  
++  //Define in the usb audio 2 specification (Audio20 final.pdf) on page 26
++  #define USB_AUDIO_CHANNEL_FL  (1<<0)  //front left
++  #define USB_AUDIO_CHANNEL_FR  (1<<1)  //front right
++  #define USB_AUDIO_CHANNEL_FC  (1<<2)  //front center
++  #define USB_AUDIO_CHANNEL_LFE (1<<3)  //low frequency effects
++  #define USB_AUDIO_CHANNEL_RL  (1<<4)  //rear left sometimes called BL (back left)
++  #define USB_AUDIO_CHANNEL_RR  (1<<5)  //rear right sometimes called BR (back right)
++  #define USB_AUDIO_CHANNEL_FLC (1<<6)  //front left of center
++  #define USB_AUDIO_CHANNEL_FRC (1<<7)  //front right of center
++  #define USB_AUDIO_CHANNEL_RC  (1<<8)  //rear center
++  #define USB_AUDIO_CHANNEL_SL  (1<<9)  //side left
++  #define USB_AUDIO_CHANNEL_SR  (1<<10) //side right
++
++  #define USB_AUDIO_CHANNEL_TC  (1<<11)   //top center
++  #define USB_AUDIO_CHANNEL_TFL  (1<<12)  //top front left
++  #define USB_AUDIO_CHANNEL_TFC  (1<<13)  //top front center
++  #define USB_AUDIO_CHANNEL_TFR  (1<<14)  //top front right
++  #define USB_AUDIO_CHANNEL_TRL  (1<<15)  //top rear left
++  #define USB_AUDIO_CHANNEL_TRC  (1<<16)  //top rear center
++  #define USB_AUDIO_CHANNEL_TRR  (1<<17)  //top rear right
++  #define USB_AUDIO_CHANNEL_TFLC  (1<<18) //top front left of center
++  #define USB_AUDIO_CHANNEL_TFRC  (1<<19) //top front right of center
++
++  #define USB_AUDIO_CHANNEL_LLFE  (1<<20) //left low frequency effects
++  #define USB_AUDIO_CHANNEL_RLFE  (1<<21) //right low frequency effects
++  #define USB_AUDIO_CHANNEL_TSL  (1<<22)  //top side left
++  #define USB_AUDIO_CHANNEL_TSR  (1<<23)  //top side right
++  #define USB_AUDIO_CHANNEL_BC  (1<<24)   //bottom center
++  #define USB_AUDIO_CHANNEL_RLC  (1<<25)  //rear left of center
++  #define USB_AUDIO_CHANNEL_RRC  (1<<26)  //rear right of center
++  #define USB_AUDIO_CHANNEL_RD  (1<<27)   //raw data
++
++  //ASYNC_TX_ENDPOINT: if defined, the output behaves like an asynchronous endpoint, and like an adaptive one otherwise
++	//Asynchronous: The usb audio output sometimes sends a sample more or less to the host to prevent buffer over- and underruns.
++  //Adaptive: The usb audio output sends samples twice or discards samples to prevent buffer over- and underruns.
++  // Asynchronous should be better. However, in the original USB audio implementation,
++  // the endpoint was adaptive, so it is possible to switch back to adaptive by
++  // commenting out this define (e.g., for debugging purposes).
++  #define ASYNC_TX_ENDPOINT
++  
++  // defines for 480MBit ================================
++  #if defined(AUDIO_USB_CHANNEL_COUNT) // channel count set on Tools menu...
++	#define USB_AUDIO_NO_CHANNELS_480 AUDIO_USB_CHANNEL_COUNT // ...use it
++  #else
++	#define USB_AUDIO_NO_CHANNELS_480 8 // ...or hand-edit it
++  #endif // defined(AUDIO_USB_CHANNEL_COUNT)
++  
++  #if USB_AUDIO_NO_CHANNELS_480 == 2
++      #define CHANNEL_CONFIG_480  (USB_AUDIO_CHANNEL_FL | USB_AUDIO_CHANNEL_FR)
++  #endif
++  #if USB_AUDIO_NO_CHANNELS_480 == 4
++        #define CHANNEL_CONFIG_480  (USB_AUDIO_CHANNEL_FL | USB_AUDIO_CHANNEL_FR |USB_AUDIO_CHANNEL_RL | USB_AUDIO_CHANNEL_RR)
++  #endif
++  #if USB_AUDIO_NO_CHANNELS_480 == 6
++        #define CHANNEL_CONFIG_480  (USB_AUDIO_CHANNEL_FL | USB_AUDIO_CHANNEL_FR |USB_AUDIO_CHANNEL_FC | USB_AUDIO_CHANNEL_LFE | USB_AUDIO_CHANNEL_SL | USB_AUDIO_CHANNEL_SR)
++  #endif
++  #if USB_AUDIO_NO_CHANNELS_480 == 8
++        #define CHANNEL_CONFIG_480  (USB_AUDIO_CHANNEL_FL | USB_AUDIO_CHANNEL_FR |USB_AUDIO_CHANNEL_FC | USB_AUDIO_CHANNEL_LFE | USB_AUDIO_CHANNEL_RL | USB_AUDIO_CHANNEL_RR | USB_AUDIO_CHANNEL_SL | USB_AUDIO_CHANNEL_SR)
++  #endif
++
++  
++  #define BANDWIDTH_BYTES_PER_SEC_480 AUDIO_SAMPLE_RATE_I * AUDIO_SUBSLOT_SIZE * USB_AUDIO_NO_CHANNELS_480
++  #if BANDWIDTH_BYTES_PER_SEC_480 <= 1024000*8
++    //we can not handle more than 1024bytes per mircro frame
++    //if the bandwidth is larger than that, AUDIO_POLLING_INTERVAL_480 will just not be defined and the program won't compile
++    #if BANDWIDTH_BYTES_PER_SEC_480 > 1024000 *4 //more than 1024bytes/250us -> we need 8 micro frames per ms
++      #define AUDIO_POLLING_INTERVAL_480 1  //1 -> 2^(1-1)=1 -> every micro-frame
++    #elif BANDWIDTH_BYTES_PER_SEC_480 > 1024000 *2 //more than 1024bytes/500us -> we need 4 micro frames per ms
++      #define AUDIO_POLLING_INTERVAL_480 2  //2 -> 2^(2-1)=2 -> every 2 micro-frames
++    #elif BANDWIDTH_BYTES_PER_SEC_480 > 1024000 //more than 1024bytes/1000us -> we need 2 micro frames per ms
++      #define AUDIO_POLLING_INTERVAL_480 3  //3 -> 2^(3-1)=4 -> every 4 micro-frames
++    #else
++      #define AUDIO_POLLING_INTERVAL_480 4  //4 -> 2^(4-1)=8 -> every 8 micro-frames
++    #endif
++  #endif
++
++  #define AUDIO_NUM_SUBFRAMES_PER_POLLING_480 (1<<(AUDIO_POLLING_INTERVAL_480-1))
++  #define AUDIO_POLLING_INTERVAL_480_SEC (AUDIO_NUM_SUBFRAMES_PER_POLLING_480 *125*1e-6)
++  
++  //AUDIO_RX_SIZE we add 10 percent to the tx buffer in order to be able to request more samples per polling interval (e.g. the clock of the usb host runs slower than the teensy clock)
++  #define AUDIO_RX_SIZE_480         (uint32_t)(((uint32_t)((AUDIO_SAMPLE_RATE * AUDIO_POLLING_INTERVAL_480_SEC) * 1.1)) * USB_AUDIO_NO_CHANNELS_480 * AUDIO_SUBSLOT_SIZE)
++  #define AUDIO_TX_SIZE_480         AUDIO_RX_SIZE_480
++  // end of defines for 480MBit ================================
++
++  // defines for 12MBit ================================
++  #if defined(AUDIO_USB_CHANNEL_COUNT) // channel count set on Tools menu...
++	#define USB_AUDIO_NO_CHANNELS_12 AUDIO_USB_CHANNEL_COUNT // ...use it
++  #else
++	#define USB_AUDIO_NO_CHANNELS_12 2 // ...or hand-edit it
++  #endif // defined(AUDIO_USB_CHANNEL_COUNT)
++  
++  // we can't receive more than 12MBit per second: if the bandwidth is larger than that, 
++  // either AUDIO_POLLING_INTERVAL_480 will just not be defined and the program won't compile,
++  // or we have to reduce the channel count.
++  #define BANDWIDTH_BYTES_PER_SEC_12 AUDIO_SAMPLE_RATE_I * AUDIO_SUBSLOT_SIZE * USB_AUDIO_NO_CHANNELS_12
++  #if BANDWIDTH_BYTES_PER_SEC_12 <= 1500000 //=12MBit
++    #if BANDWIDTH_BYTES_PER_SEC_12 > 1024000 *4 //more than 1024bytes/250us -> we need 8 micro frames per ms
++      #define AUDIO_POLLING_INTERVAL_12 1  //1 -> 2^(1-1)=1 -> every micro-frame
++    #elif BANDWIDTH_BYTES_PER_SEC_12 > 1024000 *2 //more than 1024bytes/500us -> we need 4 micro frames per ms
++      #define AUDIO_POLLING_INTERVAL_12 2  //2 -> 2^(2-1)=2 -> every 2 micro-frames
++    #elif BANDWIDTH_BYTES_PER_SEC_12 > 1024000 //more than 1024bytes/500us -> we need 2 micro frames per ms
++      #define AUDIO_POLLING_INTERVAL_12 3  //3 -> 2^(3-1)=4 -> every 4 micro-frames
++    #else
++      #define AUDIO_POLLING_INTERVAL_12 4  //4 -> 2^(4-1)=8 -> every 8 micro-frames
++    #endif
++  #else // lose some channels to get the bandwidth down: ony 8/96 is actually an issue at the moment
++    #undef USB_AUDIO_NO_CHANNELS_12
++	#undef BANDWIDTH_BYTES_PER_SEC_12
++	
++    #define USB_AUDIO_NO_CHANNELS_12 6
++    #define AUDIO_POLLING_INTERVAL_12 1  //1 -> 2^(1-1)=1 -> every micro-frame
++    #define BANDWIDTH_BYTES_PER_SEC_12 AUDIO_SAMPLE_RATE_I * AUDIO_SUBSLOT_SIZE * USB_AUDIO_NO_CHANNELS_12
++  #endif
++
++  #if USB_AUDIO_NO_CHANNELS_12 == 2
++      #define CHANNEL_CONFIG_12  (USB_AUDIO_CHANNEL_FL | USB_AUDIO_CHANNEL_FR)
++  #endif
++  #if USB_AUDIO_NO_CHANNELS_12 == 4
++        #define CHANNEL_CONFIG_12  (USB_AUDIO_CHANNEL_FL | USB_AUDIO_CHANNEL_FR |USB_AUDIO_CHANNEL_RL | USB_AUDIO_CHANNEL_RR)
++  #endif
++  #if USB_AUDIO_NO_CHANNELS_12 == 6
++        #define CHANNEL_CONFIG_12  (USB_AUDIO_CHANNEL_FL | USB_AUDIO_CHANNEL_FR |USB_AUDIO_CHANNEL_FC | USB_AUDIO_CHANNEL_LFE | USB_AUDIO_CHANNEL_SL | USB_AUDIO_CHANNEL_SR)
++  #endif
++  #if USB_AUDIO_NO_CHANNELS_12 == 8
++        #define CHANNEL_CONFIG_12  (USB_AUDIO_CHANNEL_FL | USB_AUDIO_CHANNEL_FR |USB_AUDIO_CHANNEL_FC | USB_AUDIO_CHANNEL_LFE | USB_AUDIO_CHANNEL_RL | USB_AUDIO_CHANNEL_RR | USB_AUDIO_CHANNEL_SL | USB_AUDIO_CHANNEL_SR)
++  #endif
++
++  #define AUDIO_NUM_SUBFRAMES_PER_POLLING_12 (1<<(AUDIO_POLLING_INTERVAL_12-1))
++  #define AUDIO_POLLING_INTERVAL_12_SEC (AUDIO_NUM_SUBFRAMES_PER_POLLING_12 *125*1e-6)
++  #define AUDIO_RX_SIZE_12         (uint32_t)(((uint32_t)((AUDIO_SAMPLE_RATE * AUDIO_POLLING_INTERVAL_12_SEC) * 1.1)) * USB_AUDIO_NO_CHANNELS_12 * AUDIO_SUBSLOT_SIZE)
++  #define AUDIO_TX_SIZE_12         AUDIO_RX_SIZE_12
++  // end of defines for 12MBit ================================
++  
++  #if (USB_AUDIO_NO_CHANNELS_12) < (USB_AUDIO_NO_CHANNELS_480)
++  	#define USB_AUDIO_MAX_NO_CHANNELS USB_AUDIO_NO_CHANNELS_480
++  #else
++  	#define USB_AUDIO_MAX_NO_CHANNELS USB_AUDIO_NO_CHANNELS_12
++  #endif
++#endif
++
+diff --git a/cores/teensy4/util/LastCall.h b/cores/teensy4/util/LastCall.h
+new file mode 100644
+index 0000000..de27c1a
+--- /dev/null
++++ b/cores/teensy4/util/LastCall.h
+@@ -0,0 +1,151 @@
++
++#ifdef __cplusplus
++
++#ifndef lastCall_h_
++#define lastCall_h_
++#include <arm_math.h>
++#include <array>
++#include <numeric>
++
++//This class is used to estimate last call of a function that is called at a high frequency.
++//It smoothes the time of the last call by means of history buffer that stores the time of the e.g. last 7 calls.
++//Important: The class detects up to two outliers in the history and ignores them at the computation of the time of the last call
++template <int HL>
++struct History{
++    std::array<uint32_t,HL> data;
++    bool valid=false;
++    int32_t currentWriteIndex=0;
++};
++inline double toUInt32Range(double x){
++	constexpr double largestU32 = double(uint32_t(-1));
++	constexpr double halfLargestU32 = 0.5*largestU32;
++	if (x < -halfLargestU32){
++		x += largestU32;
++	}
++	if (x > halfLargestU32){
++		x -= largestU32;
++	}
++	return x;
++}
++template <int N>
++class LastCall
++{
++    public:
++        LastCall(){
++            std::iota(_indices.begin(), _indices.end(), 0);
++        }
++        void reset(double expectedTimeStep){
++            _expectedTimeStep=expectedTimeStep;
++            _history.valid=false;
++        }
++        
++        void addCall(uint32_t time){
++            _history.data[_history.currentWriteIndex]=time;
++            _history.currentWriteIndex++;
++            if(_history.currentWriteIndex >=N){
++                _history.currentWriteIndex=0;
++            }
++            if(!_history.valid){
++                fillWithDefaultValues(_history);
++            }
++        }
++
++        History<N> getHistory() const {
++            return _history;
++        }
++        uint32_t getLastDuration()const{
++            int32_t upperIdx = (_history.currentWriteIndex +(N-1))%N;
++            int32_t lowerIdx = (_history.currentWriteIndex +(N-2))%N;
++            return _history.data[upperIdx] - _history.data[lowerIdx];
++        }
++        template <int O>
++        double getLastCall(const History<N>& history, double expectedTimeStep) const {
++            //We shift all data samples, so that the oldest sample becomes 0 and compute the center of mass of the shifted samples.
++            uint64_t shiftedDataSum=0;
++            const uint32_t oldest=history.data[history.currentWriteIndex];
++            for (int32_t i =1; i< N; i ++){
++                uint32_t idx=(history.currentWriteIndex+i)%N;
++                shiftedDataSum+=(history.data[idx]-oldest);
++            }
++            double centerOfMass = double(shiftedDataSum)/N;
++
++            //now we want to detect outliers in the history and shift a 'perfect' data sequence into the data samples:
++
++            //assuming the 'perfect' data sequence is {0,expectedTimeStep,... (N-1)*expectedTimeStep}
++            //the expected center of mass is:
++            double centerOfMassExpected = double(N-1)*0.5*expectedTimeStep;
++            double shift = centerOfMass - centerOfMassExpected;
++            
++            std::array<double, O> largeErrors;
++            std::fill(largeErrors.begin(), largeErrors.end(), 0.);
++            std::array<int32_t, O> idxErrors;
++            std::fill(idxErrors.begin(), idxErrors.end(), 0);         
++            
++            for (int32_t i =0; i< N; i ++){
++                uint32_t idx=(history.currentWriteIndex+i)%N;
++                uint32_t dataS= history.data[idx]-oldest;   //shift all data back, close to zero in order to prevent wrap around effects
++                double error = abs(double(dataS - (shift +i*expectedTimeStep) ));
++                for (size_t j =0; j< largeErrors.size(); j++){
++                    if(error > largeErrors[j]){
++                        for (size_t k = largeErrors.size()-1; k > j; k--){
++                            largeErrors[k]=largeErrors[k-1];
++                            idxErrors[k]=idxErrors[k-1];
++                        }
++                        largeErrors[j] = error;
++                        idxErrors[j] = i;
++                        break;
++                    }
++                }
++            }
++            if(largeErrors[0] == 0.){
++                //the data seems to be perfect and we can just return the last sample
++                uint32_t idx=(history.currentWriteIndex+(N-1))%N;
++                return double(history.data[idx]);
++            }
++            //Now we compute the center of mass for a second time.
++            //This time we don't use the two outliers
++            {
++                   
++                std::array<int32_t, N> indices =_indices;
++                for (int32_t idx : idxErrors){
++                    indices[idx]=-1;
++                }
++
++                uint64_t shiftedDataSum=0;
++                double shiftedDataSumExpected=0;
++                for (int32_t i =1; i< N; i++){
++                    if(indices[i] != -1){
++                        uint32_t idx=(history.currentWriteIndex+i)%N;
++                        shiftedDataSum+=(history.data[idx]-oldest);
++                        shiftedDataSumExpected += i*expectedTimeStep;
++                    }
++                }
++                
++                double centerOfMass = double(shiftedDataSum)/(N-O); //-O because we skip two outliers
++                double centerOfMassExpected = shiftedDataSumExpected/(N-O); //-O because we skip two outliers
++                //(N-1)*expectedTimeStep is the last sample of the perfect sequence
++                double shift = centerOfMass - centerOfMassExpected + oldest;
++                return (N-1)*expectedTimeStep +shift;
++            }
++        }
++
++    private:
++        void fillWithDefaultValues(History<N>& history) const {
++            //filling with default values for convinience
++            int32_t step = (N-1);   //equal to -1
++            int32_t idx=(_history.currentWriteIndex +step)%N;
++            uint32_t currentTime = _history.data[idx];
++            idx=(idx+step)%N;
++            for (int32_t i=1; i< N; i++){
++                    history.data[idx]=currentTime - uint32_t(i*_expectedTimeStep +1);
++                    idx=(idx+step)%N;
++            }
++            history.valid=true;
++        }
++        std::array<int32_t, N> _indices;
++        History<N> _history;
++        double _expectedTimeStep=0;   //only used to initialize _history once        
++};
++
++#endif
++#endif
+\ No newline at end of file
