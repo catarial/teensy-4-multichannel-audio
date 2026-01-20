@@ -25,11 +25,12 @@ going to `File > New Window`.
 
 ## Compile
 
-Wait for the PlatformIO setup to complete.
+Wait for the PlatformIO setup to complete. Click the PlatformIO logo then
+PlatformIO Core CLI.
 
 ![PlatformIO Core CLI](pio-cli.png)
 
-To compile type `pio run` and to flash the board type `pio run --target upload`.
+To compile type `pio run` in the terminal and to flash the board type `pio run --target upload`.
 
 Since we have to patch the teensy library to get multichannel audio to work,
 it's a good idea to undo the applied patches when you're done by running
